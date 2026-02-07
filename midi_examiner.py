@@ -114,6 +114,87 @@ def ticks_to_time(ticks, tempo, ppqn):
     return (ticks / ppqn) * (tempo / 1000000)
 
 
+def ticks_to_measure_beat(absolute_ticks, ppqn, time_signatures):
+    """Convert absolute ticks to measure:beat.subdivision format.
+
+    Args:
+        absolute_ticks: Absolute tick position from start of file
+        ppqn: Pulses (ticks) per quarter note
+        time_signatures: List of time signature events with 'abs_time' field,
+                        sorted by abs_time. Each has numerator, denominator.
+
+    Returns:
+        Tuple of (measure, beat, subdivision) where measure and beat are 1-indexed
+    """
+    if not time_signatures:
+        # Default to 4/4 if no time signature
+        time_signatures = [{"abs_time": 0, "numerator": 4, "denominator": 4}]
+
+    # Find applicable time signature regions and calculate measure/beat
+    current_tick = 0
+    current_measure = 1
+    ts_idx = 0
+
+    while ts_idx < len(time_signatures):
+        ts = time_signatures[ts_idx]
+        next_ts_tick = (time_signatures[ts_idx + 1]["abs_time"]
+                       if ts_idx + 1 < len(time_signatures) else float('inf'))
+
+        # Ticks per beat for this time signature
+        # denominator 4 = quarter note = ppqn ticks
+        # denominator 8 = eighth note = ppqn/2 ticks
+        # denominator 2 = half note = ppqn*2 ticks
+        ticks_per_beat = ppqn * 4 // ts["denominator"]
+        ticks_per_measure = ticks_per_beat * ts["numerator"]
+
+        # How many ticks are in this time signature region?
+        region_end = min(next_ts_tick, absolute_ticks)
+        ticks_in_region = region_end - current_tick
+
+        if ticks_in_region <= 0:
+            ts_idx += 1
+            continue
+
+        if absolute_ticks <= next_ts_tick:
+            # Target is in this region
+            ticks_from_region_start = absolute_ticks - current_tick
+            measures_in_region = ticks_from_region_start // ticks_per_measure
+            remaining_ticks = ticks_from_region_start % ticks_per_measure
+
+            measure = current_measure + measures_in_region
+            beat = remaining_ticks // ticks_per_beat + 1
+            subdivision = remaining_ticks % ticks_per_beat
+
+            return (int(measure), int(beat), int(subdivision))
+        else:
+            # Move past this region
+            measures_in_region = ticks_in_region // ticks_per_measure
+            current_measure += measures_in_region
+            current_tick = next_ts_tick
+            ts_idx += 1
+
+    # Shouldn't reach here, but fallback
+    return (1, 1, 0)
+
+
+def format_position(absolute_ticks, ppqn, time_signatures):
+    """Format tick position as 'measure:beat.sub (tick N)'.
+
+    Args:
+        absolute_ticks: Absolute tick position
+        ppqn: Pulses per quarter note
+        time_signatures: List of time signature events with abs_time
+
+    Returns:
+        Formatted string like "measure 5, beat 2 (tick 1920)"
+    """
+    measure, beat, subdivision = ticks_to_measure_beat(absolute_ticks, ppqn, time_signatures)
+    if subdivision > 0:
+        return f"measure {measure}, beat {beat}.{subdivision} (tick {absolute_ticks})"
+    else:
+        return f"measure {measure}, beat {beat} (tick {absolute_ticks})"
+
+
 def analyze_midi_file(filepath):
     """Analyze a MIDI file and return structured data."""
     try:
@@ -162,6 +243,24 @@ def analyze_midi_file(filepath):
     # Track detected MIDI standard (GM, GM2, GS, XG)
     detected_standard = None
 
+    # First pass: collect time signatures with absolute times
+    # (needed for measure/beat calculations)
+    time_signatures_abs = []
+    for track in mid.tracks:
+        abs_time = 0
+        for msg in track:
+            abs_time += msg.time
+            if msg.type == 'time_signature':
+                time_signatures_abs.append({
+                    "abs_time": abs_time,
+                    "numerator": msg.numerator,
+                    "denominator": msg.denominator
+                })
+    # Sort by absolute time and remove duplicates at same position
+    time_signatures_abs.sort(key=lambda x: x["abs_time"])
+    # Store for use in output formatting
+    results["timing"]["time_signatures_abs"] = time_signatures_abs
+
     # Process each track
     for track_idx, track in enumerate(mid.tracks):
         track_info = {
@@ -170,7 +269,11 @@ def analyze_midi_file(filepath):
             "events": 0
         }
 
+        # Track absolute time for this track
+        abs_time = 0
+
         for msg in track:
+            abs_time += msg.time
             track_info["events"] += 1
 
             # Meta messages
@@ -186,21 +289,21 @@ def analyze_midi_file(filepath):
                 results["text_events"].append({
                     "track": track_idx,
                     "text": msg.text,
-                    "time": msg.time
+                    "abs_time": abs_time
                 })
 
             elif msg.type == 'marker':
                 results["markers"].append({
                     "track": track_idx,
                     "marker": msg.text,
-                    "time": msg.time
+                    "abs_time": abs_time
                 })
 
             elif msg.type == 'cue_marker':
                 results["cue_points"].append({
                     "track": track_idx,
                     "cue": msg.text,
-                    "time": msg.time
+                    "abs_time": abs_time
                 })
 
             elif msg.type == 'set_tempo':
@@ -210,7 +313,7 @@ def analyze_midi_file(filepath):
                 results["timing"]["tempo"].append({
                     "microseconds_per_beat": msg.tempo,
                     "bpm": round(bpm, 2),
-                    "time": msg.time
+                    "abs_time": abs_time
                 })
 
             elif msg.type == 'time_signature':
@@ -221,7 +324,7 @@ def analyze_midi_file(filepath):
                     "denominator": msg.denominator,
                     "clocks_per_click": msg.clocks_per_click,
                     "notated_32nd_notes_per_beat": msg.notated_32nd_notes_per_beat,
-                    "time": msg.time
+                    "abs_time": abs_time
                 })
 
             elif msg.type == 'key_signature':
@@ -254,7 +357,7 @@ def analyze_midi_file(filepath):
                 results["metadata"]["lyrics"].append({
                     "track": track_idx,
                     "text": msg.text,
-                    "time": msg.time
+                    "abs_time": abs_time
                 })
 
             # SysEx messages
@@ -363,13 +466,18 @@ def print_results(results):
         print(f"  Timing Type:   PPQ (Pulses Per Quarter Note)")
         print(f"  PPQN:          {timing['ppqn']} ticks per quarter note")
 
+    # Get timing info for measure/beat calculations
+    ppqn = timing.get("ppqn", 480)
+    time_sigs_abs = timing.get("time_signatures_abs", [])
+
     if "tempo" in timing and timing["tempo"]:
         print_subsection("Tempo Changes")
         for i, tempo in enumerate(timing["tempo"]):
             if i == 0:
-                print(f"  Initial:       {tempo['bpm']} BPM ({tempo['microseconds_per_beat']} \u00b5s/beat)")
+                print(f"  Initial:       {tempo['bpm']} BPM ({tempo['microseconds_per_beat']} µs/beat)")
             else:
-                print(f"  Change {i}:      {tempo['bpm']} BPM at tick {tempo['time']}")
+                pos = format_position(tempo['abs_time'], ppqn, time_sigs_abs)
+                print(f"  Change {i}:      {tempo['bpm']} BPM at {pos}")
 
     if "time_signature" in timing and timing["time_signature"]:
         print_subsection("Time Signature(s)")
@@ -378,7 +486,8 @@ def print_results(results):
             if i == 0:
                 print(f"  Initial:       {sig}")
             else:
-                print(f"  Change {i}:      {sig} at tick {ts['time']}")
+                pos = format_position(ts['abs_time'], ppqn, time_sigs_abs)
+                print(f"  Change {i}:      {sig} at {pos}")
             print(f"                 ({ts['clocks_per_click']} MIDI clocks/click, "
                   f"{ts['notated_32nd_notes_per_beat']} 32nd notes/beat)")
 
@@ -422,13 +531,15 @@ def print_results(results):
     if results["markers"]:
         print_section("MARKERS")
         for marker in results["markers"]:
-            print(f"  Track {marker['track']}: \"{marker['marker']}\" (tick {marker['time']})")
+            pos = format_position(marker['abs_time'], ppqn, time_sigs_abs)
+            print(f"  Track {marker['track']}: \"{marker['marker']}\" at {pos}")
 
     # Cue Points
     if results["cue_points"]:
         print_section("CUE POINTS")
         for cue in results["cue_points"]:
-            print(f"  Track {cue['track']}: \"{cue['cue']}\" (tick {cue['time']})")
+            pos = format_position(cue['abs_time'], ppqn, time_sigs_abs)
+            print(f"  Track {cue['track']}: \"{cue['cue']}\" at {pos}")
 
     # Lyrics
     if "lyrics" in results["metadata"] and results["metadata"]["lyrics"]:
