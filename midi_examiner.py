@@ -195,6 +195,69 @@ def format_position(absolute_ticks, ppqn, time_signatures):
         return f"measure {measure}, beat {beat} (tick {absolute_ticks})"
 
 
+def determine_minimum_sc_version(results):
+    """Determine the minimum Sound Canvas version required to play a GS MIDI file.
+
+    Examines all program changes and their bank select values to find which
+    Sound Canvas generation first introduced each patch used in the file.
+
+    Args:
+        results: The analysis results dict (must have detected_standard == "GS")
+
+    Returns:
+        Dict with keys: minimum_sc_version, minimum_sc_generation,
+        uses_cm64_pcm, uses_cm64_la
+    """
+    conn = midi_patches_db.get_connection()
+    cursor = conn.cursor()
+
+    SC_GENERATIONS = {1: "SC-55", 2: "SC-88", 3: "SC-88Pro", 4: "SC-8850"}
+    max_generation = 1  # Default to SC-55 (generation 1)
+    uses_cm64_pcm = False
+    uses_cm64_la = False
+
+    for pc in results["program_changes"]:
+        msb = pc["bank_msb"]
+        program = pc["program"]
+        is_percussion = pc["is_percussion"]
+
+        # Check for CM-64 patches
+        if msb == 126:
+            uses_cm64_pcm = True
+            continue
+        if msb == 127:
+            uses_cm64_la = True
+            continue
+
+        if is_percussion:
+            # Find the minimum bank_lsb that has this drum kit
+            cursor.execute("""
+                SELECT MIN(bank_lsb) FROM percussion_sets
+                WHERE standard = 'GS' AND bank_msb = 0 AND program = ?
+            """, (program,))
+        else:
+            # Find the minimum bank_lsb that has this (msb, program) combo
+            cursor.execute("""
+                SELECT MIN(bank_lsb) FROM patches
+                WHERE standard = 'GS' AND bank_msb = ? AND program = ?
+            """, (msb, program))
+
+        row = cursor.fetchone()
+        if row and row[0] is not None:
+            min_lsb = row[0]
+            if min_lsb > max_generation:
+                max_generation = min_lsb
+
+    conn.close()
+
+    return {
+        "minimum_sc_version": SC_GENERATIONS.get(max_generation, f"Unknown ({max_generation})"),
+        "minimum_sc_generation": max_generation,
+        "uses_cm64_pcm": uses_cm64_pcm,
+        "uses_cm64_la": uses_cm64_la,
+    }
+
+
 def analyze_midi_file(filepath):
     """Analyze a MIDI file and return structured data."""
     try:
@@ -419,8 +482,25 @@ def analyze_midi_file(filepath):
 
         results["tracks"].append(track_info)
 
+    # If no standard detected via SysEx, check if file is GM-compatible:
+    # all bank selects must be MSB=0, LSB=0 (base GM range)
+    standard_assumed = False
+    if detected_standard is None:
+        all_gm_banks = all(
+            bs["value"] == 0
+            for bs in results["bank_selects"]
+        )
+        if all_gm_banks:  # True even when bank_selects is empty
+            detected_standard = "GM"
+            standard_assumed = True
+
     # Store detected MIDI standard
     results["detected_standard"] = detected_standard
+    results["standard_assumed"] = standard_assumed
+
+    # Determine minimum Sound Canvas version for GS files
+    if detected_standard == "GS":
+        results["gs_info"] = determine_minimum_sc_version(results)
 
     return results
 
@@ -453,6 +533,11 @@ def print_results(results):
         minutes = int(info['length_seconds'] // 60)
         seconds = info['length_seconds'] % 60
         print(f"  Length:        {minutes}:{seconds:05.2f}")
+    standard = results.get("detected_standard")
+    if standard:
+        assumed = results.get("standard_assumed", False)
+        suffix = " (assumed — no reset SysEx found)" if assumed else " (detected via SysEx)"
+        print(f"  MIDI Standard: {standard}{suffix}")
 
     # Timing Information
     print_section("TIMING INFORMATION")
@@ -590,6 +675,16 @@ def print_results(results):
         print(f"  GM/GM2 detected:      {'Yes' if gm_messages else 'No'}")
         print(f"  Roland GS detected:   {'Yes' if gs_messages else 'No'}")
         print(f"  Yamaha XG detected:   {'Yes' if xg_messages else 'No'}")
+
+        # GS version requirements
+        if "gs_info" in results:
+            gs = results["gs_info"]
+            print_subsection("Roland GS Requirements")
+            print(f"  Minimum SC version:   {gs['minimum_sc_version']}")
+            if gs["uses_cm64_pcm"]:
+                print(f"  CM-64 PCM patches:    Yes (MSB 126)")
+            if gs["uses_cm64_la"]:
+                print(f"  CM-64 LA patches:     Yes (MSB 127)")
     else:
         print("  (No SysEx messages found)")
 

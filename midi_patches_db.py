@@ -7,10 +7,14 @@ percussion sets across GM, GM2, GS, and XG standards.
 """
 
 import sqlite3
+import csv
 import os
 
-# Database path - same directory as this module
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "midi_patches.db")
+# Paths - same directory as this module
+_MODULE_DIR = os.path.dirname(os.path.abspath(__file__))
+DB_PATH = os.path.join(_MODULE_DIR, "midi_patches.db")
+GS_INSTRUMENTS_CSV = os.path.join(_MODULE_DIR, "gs_instruments.csv")
+GS_DRUMKITS_CSV = os.path.join(_MODULE_DIR, "gs_drumkits.csv")
 
 # GM instrument names (0-127)
 GM_INSTRUMENTS = [
@@ -354,6 +358,8 @@ def init_database():
         _populate_gm_patches(conn)
         _populate_gm2_patches(conn)
         _populate_drum_kits(conn)
+        _populate_gs_patches(conn)
+        _populate_gs_drumkits(conn)
 
     conn.close()
 
@@ -408,6 +414,89 @@ def _populate_drum_kits(conn):
     conn.commit()
 
 
+def _populate_gs_patches(conn):
+    """Populate GS patches from gs_instruments.csv.
+
+    CSV columns: CC00, PC, CC32=4 (SC-8850), CC32=3 (SC-88Pro),
+                 CC32=2 (SC-88), CC32=1 (SC-55/CM-64)
+    bank_lsb encodes Sound Canvas generation: 4=SC-8850, 3=SC-88Pro,
+    2=SC-88, 1=SC-55.
+    """
+    if not os.path.exists(GS_INSTRUMENTS_CSV):
+        return
+
+    cursor = conn.cursor()
+    # CC32 values corresponding to columns 2-5 (index in row)
+    cc32_values = [4, 3, 2, 1]
+
+    last_valid_pc = 0  # Track last valid PC for correcting data errors
+
+    with open(GS_INSTRUMENTS_CSV, newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        next(reader)  # Skip header
+
+        for row in reader:
+            if len(row) < 6:
+                continue
+
+            msb = int(row[0])
+            pc_raw = int(row[1])
+
+            # Fix invalid PC values (>127) by using last valid PC
+            if pc_raw > 127:
+                pc = last_valid_pc
+            else:
+                pc = pc_raw
+                last_valid_pc = pc
+
+            # Insert for each non-empty Sound Canvas column
+            for col_idx, cc32 in enumerate(cc32_values):
+                cell = row[2 + col_idx].strip()
+                if cell:
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO patches
+                        (standard, bank_msb, bank_lsb, program, name, category)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, ("GS", msb, cc32, pc, cell, None))
+
+    conn.commit()
+
+
+def _populate_gs_drumkits(conn):
+    """Populate GS drum kits from gs_drumkits.csv.
+
+    CSV columns: PC, CC32=4 (SC-8850), CC32=3 (SC-88Pro),
+                 CC32=2 (SC-88), CC32=1 (SC-55)
+    bank_msb is always 0 for GS drum kits.
+    """
+    if not os.path.exists(GS_DRUMKITS_CSV):
+        return
+
+    cursor = conn.cursor()
+    cc32_values = [4, 3, 2, 1]
+
+    with open(GS_DRUMKITS_CSV, newline='', encoding='utf-8') as f:
+        reader = csv.reader(f)
+        next(reader)  # Skip header
+
+        for row in reader:
+            if len(row) < 5:
+                continue
+
+            pc = int(row[0])
+
+            for col_idx, cc32 in enumerate(cc32_values):
+                cell = row[1 + col_idx].strip()
+                if cell:
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO percussion_sets
+                        (standard, bank_msb, bank_lsb, program, name)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, ("GS", 0, cc32, pc, cell))
+
+    conn.commit()
+
+
 def get_patch_name(bank_msb, bank_lsb, program, standard=None):
     """
     Look up patch name from database.
@@ -433,6 +522,25 @@ def get_patch_name(bank_msb, bank_lsb, program, standard=None):
             WHERE standard = ? AND bank_msb = ? AND bank_lsb = ? AND program = ?
         """, (standard, bank_msb, bank_lsb, program))
         result = cursor.fetchone()
+
+    # GS-specific fallback: try lower bank_lsb values (older SC generations)
+    if not result and standard == "GS":
+        for fallback_lsb in range(bank_lsb - 1, 0, -1):
+            cursor.execute("""
+                SELECT name, category FROM patches
+                WHERE standard = 'GS' AND bank_msb = ? AND bank_lsb = ? AND program = ?
+            """, (bank_msb, fallback_lsb, program))
+            result = cursor.fetchone()
+            if result:
+                break
+
+        # Fall back to base GS patch (MSB=0, LSB=1)
+        if not result and (bank_msb != 0 or bank_lsb != 1):
+            cursor.execute("""
+                SELECT name, category FROM patches
+                WHERE standard = 'GS' AND bank_msb = 0 AND bank_lsb = 1 AND program = ?
+            """, (program,))
+            result = cursor.fetchone()
 
     # If no match, try any standard with exact bank/program
     if not result:
@@ -490,6 +598,26 @@ def get_percussion_name(bank_msb, bank_lsb, program, standard=None):
             WHERE standard = ? AND bank_msb = ? AND bank_lsb = ? AND program = ?
         """, (standard, bank_msb, bank_lsb, program))
         result = cursor.fetchone()
+
+    # GS-specific fallback: try lower bank_lsb values (older SC generations),
+    # then SC-55 base kit (lsb=1) — covers the common case where no CC32 is
+    # sent on the percussion channel (bank_lsb stays at 0).
+    if not result and standard == "GS":
+        for fallback_lsb in range(bank_lsb - 1, 0, -1):
+            cursor.execute("""
+                SELECT name FROM percussion_sets
+                WHERE standard = 'GS' AND bank_msb = ? AND bank_lsb = ? AND program = ?
+            """, (bank_msb, fallback_lsb, program))
+            result = cursor.fetchone()
+            if result:
+                break
+        # Final GS fallback: SC-55 base kit (lsb=1) when no CC32 was sent
+        if not result:
+            cursor.execute("""
+                SELECT name FROM percussion_sets
+                WHERE standard = 'GS' AND bank_msb = ? AND bank_lsb = 1 AND program = ?
+            """, (bank_msb, program))
+            result = cursor.fetchone()
 
     # If no match, try any standard with exact bank/program
     if not result:
