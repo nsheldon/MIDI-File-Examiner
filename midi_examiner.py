@@ -15,6 +15,8 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
+__version__ = "1.0.0-beta.1"
+
 # Import the database module for patch lookups
 import midi_patches_db
 
@@ -753,6 +755,8 @@ Examples:
                         help="Show more detailed output")
     parser.add_argument("--json", action="store_true",
                         help="Output results as JSON")
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {__version__}")
 
     args = parser.parse_args()
 
