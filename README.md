@@ -39,6 +39,7 @@ python midi_examiner.py --json <midi_file> > analysis.json
 | `midi_file` | Path to the MIDI file to analyze |
 | `-v`, `--verbose` | Show more detailed output |
 | `--json` | Output results as JSON instead of formatted text |
+| `--version` | Show the version number and exit |
 
 ## Example Output
 
