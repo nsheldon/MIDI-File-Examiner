@@ -15,7 +15,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.0.0-beta.2"
+__version__ = "1.0.0-beta.3"
 
 # Import the database module for patch lookups
 import midi_patches_db
@@ -495,6 +495,19 @@ def analyze_midi_file(filepath):
         if all_gm_banks:  # True even when bank_selects is empty
             detected_standard = "GM"
             standard_assumed = True
+
+    # If a GM Reset was detected, check whether the file actually targets GM2:
+    # GM only defines program 0 on the percussion channel. Any other program
+    # on channel 10 implies the file requires GM2 (which adds TR-808, Jazz,
+    # Brush, Orchestra kits, etc.).
+    if detected_standard == "GM":
+        ch10_non_gm = any(
+            pc["program"] != 0
+            for pc in results["program_changes"]
+            if pc["is_percussion"]
+        )
+        if ch10_non_gm:
+            detected_standard = "GM2"
 
     # Store detected MIDI standard
     results["detected_standard"] = detected_standard
