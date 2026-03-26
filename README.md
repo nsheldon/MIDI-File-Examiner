@@ -15,6 +15,7 @@ A command-line tool for analyzing MIDI files. It extracts and displays comprehen
 
 - Python 3.6+
 - [mido](https://mido.readthedocs.io/) (`pip install mido`)
+- [PyQt6](https://pypi.org/project/PyQt6/) (`pip install PyQt6`) — GUI only
 
 ## Installation
 
@@ -26,13 +27,24 @@ pip install -r requirements.txt
 
 ## Usage
 
+### GUI
+
+```bash
+python midi_examiner_gui.py
+python midi_examiner_gui.py song.mid   # open a file directly on launch
+```
+
+Drag and drop a `.mid` or `.midi` file onto the window to analyze it.
+
+### Command Line
+
 ```bash
 python midi_examiner.py <midi_file>
 python midi_examiner.py --json <midi_file>
 python midi_examiner.py --json <midi_file> > analysis.json
 ```
 
-### Options
+### Command-Line Options
 
 | Option | Description |
 |--------|-------------|
