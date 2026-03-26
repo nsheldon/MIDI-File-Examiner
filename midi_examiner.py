@@ -15,7 +15,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.0.0-beta.3"
+__version__ = "1.0.0-beta.4"
 
 # Import the database module for patch lookups
 import midi_patches_db
@@ -512,6 +512,17 @@ def analyze_midi_file(filepath):
     # Store detected MIDI standard
     results["detected_standard"] = detected_standard
     results["standard_assumed"] = standard_assumed
+
+    # Re-resolve program names now that the final standard is known.
+    # Names were looked up during the track loop when detected_standard may
+    # have been None or GM; refresh them so every entry reflects the correct
+    # standard (e.g. GM2 percussion kit names after a GM→GM2 upgrade).
+    for pc in results["program_changes"]:
+        pc["program_name"] = get_instrument_name(
+            pc["program"], pc["channel"],
+            pc["bank_msb"], pc["bank_lsb"],
+            detected_standard
+        )
 
     # Determine minimum Sound Canvas version for GS files
     if detected_standard == "GS":
