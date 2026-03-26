@@ -609,10 +609,9 @@ def print_results(results):
     # Text Events
     if results["text_events"]:
         print_section("TEXT EVENTS")
-        for evt in results["text_events"][:20]:  # Limit to first 20
-            print(f"  Track {evt['track']}: \"{evt['text']}\"")
-        if len(results["text_events"]) > 20:
-            print(f"  ... and {len(results['text_events']) - 20} more text events")
+        for evt in results["text_events"]:
+            pos = format_position(evt['abs_time'], ppqn, time_sigs_abs)
+            print(f"  Track {evt['track']}: \"{evt['text']}\" at {pos}")
 
     # Markers
     if results["markers"]:
