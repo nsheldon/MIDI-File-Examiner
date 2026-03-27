@@ -16,8 +16,8 @@ try:
         QVBoxLayout, QHBoxLayout,
         QPushButton, QLineEdit, QTextEdit, QFileDialog, QTabWidget,
     )
-    from PyQt6.QtGui import QFont, QKeySequence, QAction, QDragEnterEvent, QDropEvent
-    from PyQt6.QtCore import QThread, pyqtSignal
+    from PyQt6.QtGui import QFont, QKeySequence, QAction, QDragEnterEvent, QDropEvent, QFileOpenEvent
+    from PyQt6.QtCore import QEvent, QThread, pyqtSignal
 except ImportError:
     print("Error: PyQt6 is required. Install it with: pip install PyQt6")
     sys.exit(1)
@@ -91,6 +91,38 @@ class AnalysisWorker(QThread):
             self.finished.emit(output.getvalue())
         except Exception as e:
             self.error.emit(str(e))
+
+
+class MidiApplication(QApplication):
+    """QApplication subclass that handles macOS file-open Apple Events.
+
+    When a file is dropped onto the Dock icon or opened via a file
+    association, macOS delivers an application:openFiles: Apple Event.
+    Qt translates this into a QFileOpenEvent, which must be caught here
+    (not in the window) because it can arrive before the window exists.
+    """
+
+    def __init__(self, argv):
+        super().__init__(argv)
+        self._window = None
+        self._pending_file = None
+
+    def set_window(self, window):
+        self._window = window
+        if self._pending_file:
+            window.analyze(self._pending_file)
+            self._pending_file = None
+
+    def event(self, e):
+        if isinstance(e, QFileOpenEvent):
+            path = e.file()
+            if path:
+                if self._window:
+                    self._window.analyze(path)
+                else:
+                    self._pending_file = path
+            return True
+        return super().event(e)
 
 
 class MidiExaminerWindow(QMainWindow):
@@ -224,11 +256,12 @@ class MidiExaminerWindow(QMainWindow):
 
 
 def main():
-    app = QApplication(sys.argv)
+    app = MidiApplication(sys.argv)
     app.setApplicationName("MIDI File Examiner")
     app.setApplicationVersion(__version__)
 
     window = MidiExaminerWindow()
+    app.set_window(window)
     window.show()
 
     # If a file path was passed as a command-line argument, open it immediately.
