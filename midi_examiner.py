@@ -554,6 +554,17 @@ def analyze_midi_file(filepath):
     return results
 
 
+def sanitize_text(text):
+    """Strip non-printable control characters from MIDI text strings.
+
+    MIDI text events sometimes contain embedded null bytes or other control
+    characters used as padding. Terminals silently ignore them, but GUI text
+    widgets render them as visible replacement-character boxes. Strip anything
+    below U+0020 except horizontal tab.
+    """
+    return ''.join(ch for ch in text if ch == '\t' or ord(ch) >= 0x20)
+
+
 def print_section(title):
     """Print a section header."""
     print(f"\n{'=' * 60}")
@@ -638,15 +649,15 @@ def print_results(results):
     meta = results["metadata"]
 
     if "sequence_name" in meta:
-        print(f"  Song Title:    {meta['sequence_name']}")
+        print(f"  Song Title:    {sanitize_text(meta['sequence_name'])}")
     if "copyright" in meta:
-        print(f"  Copyright:     {meta['copyright']}")
+        print(f"  Copyright:     {sanitize_text(meta['copyright'])}")
     if "key_signature" in meta:
         print(f"  Key Signature: {meta['key_signature']['key']}")
     if "instruments" in meta:
         print_subsection("Instrument Names")
         for inst in meta["instruments"]:
-            print(f"    Track {inst['track']}: {inst['name']}")
+            print(f"    Track {inst['track']}: {sanitize_text(inst['name'])}")
 
     if not any(key in meta for key in ["sequence_name", "copyright", "key_signature", "instruments"]):
         print("  (No metadata found)")
@@ -654,7 +665,7 @@ def print_results(results):
     # Track Information
     print_section("TRACK INFORMATION")
     for track in results["tracks"]:
-        name = track["name"] if track["name"] else "(unnamed)"
+        name = sanitize_text(track["name"]) if track["name"] else "(unnamed)"
         print(f"  Track {track['index']:2d}: {name} ({track['events']} events)")
 
     # Text Events
@@ -662,27 +673,27 @@ def print_results(results):
         print_section("TEXT EVENTS")
         for evt in results["text_events"]:
             pos = format_position(evt['abs_time'], ppqn, time_sigs_abs)
-            print(f"  Track {evt['track']}: \"{evt['text']}\" at {pos}")
+            print(f"  Track {evt['track']}: \"{sanitize_text(evt['text'])}\" at {pos}")
 
     # Markers
     if results["markers"]:
         print_section("MARKERS")
         for marker in results["markers"]:
             pos = format_position(marker['abs_time'], ppqn, time_sigs_abs)
-            print(f"  Track {marker['track']}: \"{marker['marker']}\" at {pos}")
+            print(f"  Track {marker['track']}: \"{sanitize_text(marker['marker'])}\" at {pos}")
 
     # Cue Points
     if results["cue_points"]:
         print_section("CUE POINTS")
         for cue in results["cue_points"]:
             pos = format_position(cue['abs_time'], ppqn, time_sigs_abs)
-            print(f"  Track {cue['track']}: \"{cue['cue']}\" at {pos}")
+            print(f"  Track {cue['track']}: \"{sanitize_text(cue['cue'])}\" at {pos}")
 
     # Lyrics
     if "lyrics" in results["metadata"] and results["metadata"]["lyrics"]:
         print_section("LYRICS")
         for lyric in results["metadata"]["lyrics"][:20]:
-            print(f"  \"{lyric['text']}\"")
+            print(f"  \"{sanitize_text(lyric['text'])}\"")
         if len(results["metadata"]["lyrics"]) > 20:
             print(f"  ... and {len(results['metadata']['lyrics']) - 20} more lyrics")
 
