@@ -98,13 +98,28 @@ class AnalysisWorker(QThread):
 # ── appearance helpers ────────────────────────────────────────────────────────
 
 def _is_dark_mode(app):
-    """Return True when the OS is currently in dark mode."""
+    """Return True when the OS is currently in dark mode.
+
+    On macOS the Qt platform plugin may not have finished initialising when
+    this is first called, so styleHints/palette are unreliable at that point.
+    Reading the preference directly with 'defaults' is immediate and works on
+    all macOS versions regardless of Qt state.
+    """
+    if sys.platform == "darwin":
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["defaults", "read", "-g", "AppleInterfaceStyle"],
+                capture_output=True, text=True, timeout=2,
+            )
+            return result.stdout.strip().lower() == "dark"
+        except Exception:
+            pass
+    # Non-macOS or 'defaults' unavailable: fall back to Qt APIs
     try:
-        # Qt 6.5+: authoritative API
         return app.styleHints().colorScheme() == Qt.ColorScheme.Dark
     except AttributeError:
         pass
-    # Fallback for older Qt: check whether the default window background is dark
     return app.palette().color(QPalette.ColorRole.Window).lightness() < 128
 
 
