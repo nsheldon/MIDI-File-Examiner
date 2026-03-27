@@ -15,7 +15,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.0.0-beta.4"
+__version__ = "1.0.0-beta.5"
 
 # Import the database module for patch lookups
 import midi_patches_db
@@ -262,11 +262,16 @@ def determine_minimum_sc_version(results):
 
 def analyze_midi_file(filepath):
     """Analyze a MIDI file and return structured data."""
+    clipped = False
     try:
         mid = mido.MidiFile(filepath)
-    except Exception as e:
-        print(f"Error opening MIDI file: {e}")
-        sys.exit(1)
+    except Exception:
+        try:
+            mid = mido.MidiFile(filepath, clip=True)
+            clipped = True
+        except Exception as e:
+            print(f"Error opening MIDI file: {e}")
+            sys.exit(1)
 
     results = {
         "file_info": {},
@@ -279,7 +284,13 @@ def analyze_midi_file(filepath):
         "text_events": [],
         "markers": [],
         "cue_points": [],
+        "warnings": [],
     }
+
+    if clipped:
+        results["warnings"].append(
+            "File contains out-of-range data bytes (clipped to valid range during parsing)."
+        )
 
     # File info
     results["file_info"]["filename"] = filepath
@@ -545,6 +556,10 @@ def print_subsection(title):
 
 def print_results(results):
     """Print the analysis results in a readable format."""
+
+    # Warnings
+    for warning in results.get("warnings", []):
+        print(f"WARNING: {warning}")
 
     # File Information
     print_section("FILE INFORMATION")
