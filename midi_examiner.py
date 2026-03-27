@@ -15,7 +15,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.0.0-beta.5"
+__version__ = "1.0.0-beta.6"
 
 # Import the database module for patch lookups
 import midi_patches_db
@@ -535,6 +535,18 @@ def analyze_midi_file(filepath):
             detected_standard
         )
 
+    # For XG: Bank Select MSB 127 designates any channel as a rhythm/percussion
+    # channel, not just channel 10. MSB 126 is the SFX kit, also rhythm-arranged.
+    # Apply this after standard is finalized and names are re-resolved.
+    if detected_standard == "XG":
+        for pc in results["program_changes"]:
+            if pc["bank_msb"] in (126, 127) and not pc["is_percussion"]:
+                pc["is_percussion"] = True
+                name = midi_patches_db.get_percussion_name(
+                    pc["bank_msb"], pc["bank_lsb"], pc["program"], detected_standard
+                )
+                pc["program_name"] = name if name else f"Drum Kit {pc['program']}"
+
     # Determine minimum Sound Canvas version for GS files
     if detected_standard == "GS":
         results["gs_info"] = determine_minimum_sc_version(results)
@@ -755,9 +767,8 @@ def print_results(results):
 
         for channel in sorted(by_channel.keys()):
             changes = by_channel[channel]
-            # Label channel 10 as percussion
             channel_label = f"Channel {channel}"
-            if channel == 10:
+            if any(pc["is_percussion"] for pc in changes):
                 channel_label += " (Percussion)"
             print(f"\n  {channel_label}:")
             seen = set()
