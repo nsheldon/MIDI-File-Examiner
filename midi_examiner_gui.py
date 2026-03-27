@@ -16,8 +16,10 @@ try:
         QVBoxLayout, QHBoxLayout,
         QPushButton, QLineEdit, QTextEdit, QFileDialog, QTabWidget,
     )
-    from PyQt6.QtGui import QFont, QKeySequence, QAction, QDragEnterEvent, QDropEvent, QFileOpenEvent
-    from PyQt6.QtCore import QEvent, QThread, pyqtSignal
+    from PyQt6.QtGui import (QFont, QKeySequence, QAction,
+                              QDragEnterEvent, QDropEvent,
+                              QFileOpenEvent, QPalette, QColor)
+    from PyQt6.QtCore import Qt, QEvent, QThread, pyqtSignal
 except ImportError:
     print("Error: PyQt6 is required. Install it with: pip install PyQt6")
     sys.exit(1)
@@ -93,6 +95,53 @@ class AnalysisWorker(QThread):
             self.error.emit(str(e))
 
 
+# ── appearance helpers ────────────────────────────────────────────────────────
+
+def _is_dark_mode(app):
+    """Return True when the OS is currently in dark mode."""
+    try:
+        # Qt 6.5+: authoritative API
+        return app.styleHints().colorScheme() == Qt.ColorScheme.Dark
+    except AttributeError:
+        pass
+    # Fallback for older Qt: check whether the default window background is dark
+    return app.palette().color(QPalette.ColorRole.Window).lightness() < 128
+
+
+def _dark_palette():
+    """Return a QPalette suitable for Fusion dark mode."""
+    p = QPalette()
+    p.setColor(QPalette.ColorRole.Window,          QColor(53,  53,  53))
+    p.setColor(QPalette.ColorRole.WindowText,      QColor(220, 220, 220))
+    p.setColor(QPalette.ColorRole.Base,            QColor(25,  25,  25))
+    p.setColor(QPalette.ColorRole.AlternateBase,   QColor(53,  53,  53))
+    p.setColor(QPalette.ColorRole.ToolTipBase,     QColor(40,  40,  40))
+    p.setColor(QPalette.ColorRole.ToolTipText,     QColor(220, 220, 220))
+    p.setColor(QPalette.ColorRole.Text,            QColor(220, 220, 220))
+    p.setColor(QPalette.ColorRole.Button,          QColor(53,  53,  53))
+    p.setColor(QPalette.ColorRole.ButtonText,      QColor(220, 220, 220))
+    p.setColor(QPalette.ColorRole.BrightText,      Qt.GlobalColor.red)
+    p.setColor(QPalette.ColorRole.Link,            QColor(42,  130, 218))
+    p.setColor(QPalette.ColorRole.Highlight,       QColor(42,  130, 218))
+    p.setColor(QPalette.ColorRole.HighlightedText, QColor(240, 240, 240))
+    disabled = QPalette.ColorGroup.Disabled
+    p.setColor(disabled, QPalette.ColorRole.WindowText,      QColor(127, 127, 127))
+    p.setColor(disabled, QPalette.ColorRole.Text,            QColor(127, 127, 127))
+    p.setColor(disabled, QPalette.ColorRole.ButtonText,      QColor(127, 127, 127))
+    p.setColor(disabled, QPalette.ColorRole.Highlight,       QColor(80,  80,  80))
+    p.setColor(disabled, QPalette.ColorRole.HighlightedText, QColor(127, 127, 127))
+    return p
+
+
+def _apply_appearance(app):
+    """Set Fusion style and match palette to the current OS appearance."""
+    app.setStyle("Fusion")
+    if _is_dark_mode(app):
+        app.setPalette(_dark_palette())
+    else:
+        app.setPalette(app.style().standardPalette())
+
+
 class MidiApplication(QApplication):
     """QApplication subclass that handles macOS file-open Apple Events.
 
@@ -106,6 +155,14 @@ class MidiApplication(QApplication):
         super().__init__(argv)
         self._window = None
         self._pending_file = None
+        _apply_appearance(self)
+        # Re-apply when the user switches OS appearance at runtime (Qt 6.5+)
+        try:
+            self.styleHints().colorSchemeChanged.connect(
+                lambda _scheme: _apply_appearance(self)
+            )
+        except AttributeError:
+            pass  # Qt < 6.5 — appearance is applied once at startup
 
     def set_window(self, window):
         self._window = window
