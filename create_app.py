@@ -96,20 +96,19 @@ def _draw_icon(size: int) -> QImage:
         kp.closeSubpath()
         p.fillPath(kp, black_color)
 
-    # Beamed eighth notes — upper area
+    # Beamed eighth notes — drawn first so the magnifying glass overlays them
     accent = QColor(110, 190, 255)
-    nr     = s * 0.082        # note-head semi-axis
-    sw     = max(1.5, s * 0.038)   # stem width
-    bw     = max(1.5, s * 0.045)   # beam width
+    nr     = s * 0.075        # note-head semi-axis (slightly smaller to fit under glass)
+    sw     = max(1.5, s * 0.034)   # stem width
+    bw     = max(1.5, s * 0.040)   # beam width
 
-    # Note-head centres
-    n1x, n1y = s * 0.305, s * 0.355
-    n2x, n2y = s * 0.605, s * 0.295
+    # Note-head centres — shifted left/up so both sit inside the glass lens
+    n1x, n1y = s * 0.265, s * 0.340
+    n2x, n2y = s * 0.510, s * 0.285
 
-    # Beam top — horizontal offset of stem from centre of head
-    sx_off = nr * 1.08
-    beam_y1 = n1y - s * 0.235
-    beam_y2 = n2y - s * 0.235
+    sx_off  = nr * 1.08
+    beam_y1 = n1y - s * 0.210
+    beam_y2 = n2y - s * 0.210
 
     # Stems
     pen = QPen(accent, sw)
@@ -124,14 +123,48 @@ def _draw_icon(size: int) -> QImage:
     p.setPen(bpen)
     p.drawLine(QPointF(n1x + sx_off, beam_y1), QPointF(n2x + sx_off, beam_y2))
 
-    # Note heads (drawn after stems so they overlap the stem base cleanly)
+    # Note heads
     p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(accent)
     for cx, cy in ((n1x, n1y), (n2x, n2y)):
         head = QPainterPath()
         head.addEllipse(QRectF(cx - nr * 1.18, cy - nr * 0.80,
                                nr * 2.36, nr * 1.60))
         p.fillPath(head, accent)
+
+    # Magnifying glass — overlaid on the notes
+    import math
+    mg_cx = s * 0.390   # lens centre x
+    mg_cy = s * 0.295   # lens centre y
+    mg_r  = s * 0.195   # inner (clear) radius of the lens
+    mg_sw = max(2.0, s * 0.062)   # ring stroke width
+    mg_hl = s * 0.170   # handle length beyond the ring edge
+    angle = math.radians(42)      # handle direction — slightly past 45° toward lower-right
+    cos_a = math.cos(angle)
+    sin_a = math.sin(angle)
+
+    # Subtle frosted-glass fill inside the lens
+    lens_path = QPainterPath()
+    lens_path.addEllipse(QRectF(mg_cx - mg_r, mg_cy - mg_r, mg_r * 2, mg_r * 2))
+    p.fillPath(lens_path, QColor(200, 220, 255, 28))
+
+    # Ring
+    ring_pen = QPen(QColor(255, 255, 255), mg_sw)
+    ring_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    ring_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    p.setPen(ring_pen)
+    p.setBrush(Qt.BrushStyle.NoBrush)
+    p.drawEllipse(QRectF(mg_cx - mg_r, mg_cy - mg_r, mg_r * 2, mg_r * 2))
+
+    # Handle — starts at the outer edge of the ring stroke
+    r_edge = mg_r + mg_sw / 2
+    hx1 = mg_cx + r_edge * cos_a
+    hy1 = mg_cy + r_edge * sin_a
+    hx2 = hx1 + mg_hl * cos_a
+    hy2 = hy1 + mg_hl * sin_a
+    handle_pen = QPen(QColor(255, 255, 255), mg_sw)
+    handle_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+    p.setPen(handle_pen)
+    p.drawLine(QPointF(hx1, hy1), QPointF(hx2, hy2))
 
     p.end()
     return img
