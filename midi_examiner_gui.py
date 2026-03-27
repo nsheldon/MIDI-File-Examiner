@@ -7,16 +7,17 @@ A PyQt6-based graphical interface for the MIDI File Examiner.
 import sys
 import os
 import io
+import re
 import contextlib
 
 try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget,
         QVBoxLayout, QHBoxLayout,
-        QPushButton, QLineEdit, QTextEdit, QFileDialog,
+        QPushButton, QLineEdit, QTextEdit, QFileDialog, QTabWidget,
     )
     from PyQt6.QtGui import QFont, QKeySequence, QAction, QDragEnterEvent, QDropEvent
-    from PyQt6.QtCore import Qt, QUrl, QThread, pyqtSignal
+    from PyQt6.QtCore import QThread, pyqtSignal
 except ImportError:
     print("Error: PyQt6 is required. Install it with: pip install PyQt6")
     sys.exit(1)
@@ -26,6 +27,49 @@ except ImportError:
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from midi_examiner import __version__, analyze_midi_file, print_results
+
+# Mapping from ALL-CAPS section titles (as printed) to shorter tab labels.
+_TAB_LABELS = {
+    "FILE INFORMATION": "File Info",
+    "TIMING INFORMATION": "Timing",
+    "METADATA": "Metadata",
+    "TRACK INFORMATION": "Tracks",
+    "TEXT EVENTS": "Text Events",
+    "MARKERS": "Markers",
+    "CUE POINTS": "Cue Points",
+    "LYRICS": "Lyrics",
+    "SYSTEM EXCLUSIVE (SYSEX) MESSAGES": "SysEx",
+    "BANK SELECT MESSAGES": "Bank Select",
+    "PROGRAM CHANGES": "Programs",
+    "CONTROL CHANGES": "Control Changes",
+}
+
+
+def _split_sections(text):
+    """Split print_results() output into [(tab_label, body_text), ...] pairs.
+
+    Section headers are delimited by lines of 60 '=' characters. Any text
+    before the first header (e.g. warnings) becomes a 'Warnings' tab.
+    """
+    # re.split with a capturing group interleaves titles with body text:
+    # [pre, title1, body1, title2, body2, ...]
+    parts = re.split(r'\n={60}\n ([^\n]+)\n={60}', text)
+    sections = []
+
+    pre = parts[0].strip()
+    if pre:
+        sections.append(("Warnings", pre))
+
+    for i in range(1, len(parts), 2):
+        raw_title = parts[i].strip()
+        body = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        # Skip footer sentinels like "END OF ANALYSIS" that have no body
+        if not body:
+            continue
+        label = _TAB_LABELS.get(raw_title, raw_title.title())
+        sections.append((label, body))
+
+    return sections
 
 
 class AnalysisWorker(QThread):
@@ -81,6 +125,17 @@ class MidiExaminerWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         file_menu.addAction(quit_action)
 
+    def _make_text_view(self):
+        """Create a styled read-only monospace QTextEdit for a section tab."""
+        view = QTextEdit()
+        view.setReadOnly(True)
+        font = QFont("Menlo")
+        if not font.exactMatch():
+            font = QFont("Courier New")
+        font.setPointSize(11)
+        view.setFont(font)
+        return view
+
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
@@ -99,15 +154,10 @@ class MidiExaminerWindow(QMainWindow):
         file_bar.addWidget(self.open_button)
         layout.addLayout(file_bar)
 
-        # Results area
-        self.results_view = QTextEdit()
-        self.results_view.setReadOnly(True)
-        font = QFont("Menlo")
-        if not font.exactMatch():
-            font = QFont("Courier New")
-        font.setPointSize(11)
-        self.results_view.setFont(font)
-        layout.addWidget(self.results_view)
+        # Tabbed results area — one tab per analysis section
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setUsesScrollButtons(True)
+        layout.addWidget(self.tab_widget)
 
         self.statusBar().showMessage("Ready — open a MIDI file to begin.")
 
@@ -130,7 +180,7 @@ class MidiExaminerWindow(QMainWindow):
             return
 
         self.file_path_edit.setText(path)
-        self.results_view.clear()
+        self.tab_widget.clear()
         self.open_button.setEnabled(False)
         self.statusBar().showMessage("Analyzing…")
 
@@ -140,13 +190,18 @@ class MidiExaminerWindow(QMainWindow):
         self.worker.start()
 
     def _on_analysis_done(self, text):
-        self.results_view.setPlainText(text)
-        self.results_view.moveCursor(self.results_view.textCursor().MoveOperation.Start)
+        for label, content in _split_sections(text):
+            view = self._make_text_view()
+            view.setPlainText(content)
+            view.moveCursor(view.textCursor().MoveOperation.Start)
+            self.tab_widget.addTab(view, label)
         self.open_button.setEnabled(True)
         self.statusBar().showMessage("Analysis complete.")
 
     def _on_analysis_error(self, message):
-        self.results_view.setPlainText(f"Error: {message}")
+        view = self._make_text_view()
+        view.setPlainText(f"Error: {message}")
+        self.tab_widget.addTab(view, "Error")
         self.open_button.setEnabled(True)
         self.statusBar().showMessage("Error during analysis.")
 
