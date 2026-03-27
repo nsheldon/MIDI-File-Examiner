@@ -194,7 +194,10 @@ class MidiExaminerWindow(QMainWindow):
             view = self._make_text_view()
             view.setPlainText(content)
             view.moveCursor(view.textCursor().MoveOperation.Start)
-            self.tab_widget.addTab(view, label)
+            idx = self.tab_widget.addTab(view, label)
+            # Gray out tabs whose only content is a "nothing found" placeholder
+            if re.match(r'^\s*\(No .+ found\)\s*$', content):
+                self.tab_widget.setTabEnabled(idx, False)
         self.open_button.setEnabled(True)
         self.statusBar().showMessage("Analysis complete.")
 
