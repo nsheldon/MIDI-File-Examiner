@@ -56,15 +56,15 @@ def _split_sections(text):
     parts = re.split(r'\n={60}\n ([^\n]+)\n={60}', text)
     sections = []
 
-    pre = parts[0].strip()
-    if pre:
+    pre = parts[0].strip('\n')
+    if pre.strip():
         sections.append(("Warnings", pre))
 
     for i in range(1, len(parts), 2):
         raw_title = parts[i].strip()
-        body = parts[i + 1].strip() if i + 1 < len(parts) else ""
+        body = parts[i + 1].strip('\n') if i + 1 < len(parts) else ""
         # Skip footer sentinels like "END OF ANALYSIS" that have no body
-        if not body:
+        if not body.strip():
             continue
         label = _TAB_LABELS.get(raw_title, raw_title.title())
         sections.append((label, body))
