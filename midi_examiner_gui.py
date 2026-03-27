@@ -19,7 +19,7 @@ try:
     from PyQt6.QtGui import (QFont, QKeySequence, QAction,
                               QDragEnterEvent, QDropEvent,
                               QFileOpenEvent, QPalette, QColor)
-    from PyQt6.QtCore import Qt, QEvent, QThread, pyqtSignal
+    from PyQt6.QtCore import Qt, QEvent, QThread, QTimer, pyqtSignal
 except ImportError:
     print("Error: PyQt6 is required. Install it with: pip install PyQt6")
     sys.exit(1)
@@ -170,14 +170,20 @@ class MidiApplication(QApplication):
         super().__init__(argv)
         self._window = None
         self._pending_file = None
+        self._current_dark = _is_dark_mode(self)
         _apply_appearance(self)
-        # Re-apply when the user switches OS appearance at runtime (Qt 6.5+)
-        try:
-            self.styleHints().colorSchemeChanged.connect(
-                lambda _scheme: _apply_appearance(self)
-            )
-        except AttributeError:
-            pass  # Qt < 6.5 — appearance is applied once at startup
+        # Poll for OS appearance changes every 2 s using the same reliable
+        # 'defaults read' method used at startup. Qt's colorSchemeChanged
+        # signal does not fire reliably for this purpose.
+        self._appearance_timer = QTimer(self)
+        self._appearance_timer.timeout.connect(self._poll_appearance)
+        self._appearance_timer.start(2000)
+
+    def _poll_appearance(self):
+        is_dark = _is_dark_mode(self)
+        if is_dark != self._current_dark:
+            self._current_dark = is_dark
+            _apply_appearance(self)
 
     def set_window(self, window):
         self._window = window
