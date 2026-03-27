@@ -27,11 +27,30 @@ pip install -r requirements.txt
 
 ## Usage
 
-### GUI
+### GUI — macOS App Bundle
+
+For the most convenient experience, build the native macOS app bundle once after cloning:
 
 ```bash
-python midi_examiner_gui.py
-python midi_examiner_gui.py song.mid   # open a file directly on launch
+python3 create_app.py
+```
+
+This generates **MIDI File Examiner.app** in the project folder. You can then:
+
+- **Double-click** the icon in Finder to launch it
+- **Drag it to the Dock** for quick access
+- **Drag a `.mid` or `.midi` file onto the Dock icon** to open it directly
+- **Double-click any `.mid`/`.midi` file** and choose *Open With → MIDI File Examiner* from the context menu
+
+The app automatically matches the macOS Light or Dark appearance and updates if you switch while it is running.
+
+> **Rebuilding:** If you upgrade Python or reinstall PyQt6, run `python3 create_app.py` again to regenerate the launcher with the correct interpreter path.
+
+### GUI — Command Line
+
+```bash
+python3 midi_examiner_gui.py
+python3 midi_examiner_gui.py song.mid   # open a file directly on launch
 ```
 
 Drag and drop a `.mid` or `.midi` file onto the window to analyze it.
