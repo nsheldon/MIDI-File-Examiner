@@ -726,11 +726,9 @@ def print_results(results):
 
         if other_messages:
             print_subsection("Other SysEx")
-            for msg in other_messages[:10]:
+            for msg in other_messages:
                 print(f"  Track {msg['track']}: {msg['description']}")
                 print(f"    Data: F0 {msg['data_hex']} F7")
-            if len(other_messages) > 10:
-                print(f"  ... and {len(other_messages) - 10} more SysEx messages")
 
         # Summary
         print_subsection("SysEx Summary")
