@@ -17,3 +17,6 @@ build/
 
 # Claude Code
 .claude/
+
+# Generated .app bundle (rebuild with: python3 create_app.py)
+*.app/
