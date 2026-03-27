@@ -15,7 +15,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.0.0-beta.7"
+__version__ = "1.0.0-beta.8"
 
 # Import the database module for patch lookups
 import midi_patches_db
