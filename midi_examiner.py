@@ -496,8 +496,9 @@ def analyze_midi_file(filepath):
         results["tracks"].append(track_info)
 
     # If no standard detected via SysEx, check if file is GM-compatible:
-    # all bank selects must be MSB=0, LSB=0 (base GM range)
+    # all bank selects must use value=0 (base GM range)
     standard_assumed = False
+    standard_unknown_reason = None
     if detected_standard is None:
         all_gm_banks = all(
             bs["value"] == 0
@@ -506,6 +507,33 @@ def analyze_midi_file(filepath):
         if all_gm_banks:  # True even when bank_selects is empty
             detected_standard = "GM"
             standard_assumed = True
+        else:
+            # Build a human-readable reason. Non-zero MSBs are the primary
+            # indicator; only fall back to LSBs if all MSBs are zero.
+            bad_msbs = sorted({
+                (bs["channel"], bs["value"])
+                for bs in results["bank_selects"]
+                if bs["type"] == "MSB" and bs["value"] != 0
+            })
+            if bad_msbs:
+                parts = [f"MSB {v} on channel {ch}" for ch, v in bad_msbs]
+                noun = "value" if len(parts) == 1 else "values"
+                standard_unknown_reason = (
+                    f"no SysEx detected; unrecognized bank {noun}: "
+                    + ", ".join(parts)
+                )
+            else:
+                bad_lsbs = sorted({
+                    (bs["channel"], bs["value"])
+                    for bs in results["bank_selects"]
+                    if bs["type"] == "LSB" and bs["value"] != 0
+                })
+                parts = [f"LSB {v} on channel {ch}" for ch, v in bad_lsbs]
+                noun = "value" if len(parts) == 1 else "values"
+                standard_unknown_reason = (
+                    f"no SysEx detected; non-standard bank {noun}: "
+                    + ", ".join(parts)
+                )
 
     # If a GM Reset was detected, check whether the file actually targets GM2:
     # GM only defines program 0 on the percussion channel. Any other program
@@ -523,6 +551,7 @@ def analyze_midi_file(filepath):
     # Store detected MIDI standard
     results["detected_standard"] = detected_standard
     results["standard_assumed"] = standard_assumed
+    results["standard_unknown_reason"] = standard_unknown_reason
 
     # Re-resolve program names now that the final standard is known.
     # Names were looked up during the track loop when detected_standard may
@@ -602,6 +631,10 @@ def print_results(results):
         assumed = results.get("standard_assumed", False)
         suffix = " (assumed — no reset SysEx found)" if assumed else " (detected via SysEx)"
         print(f"  MIDI Standard: {standard}{suffix}")
+    else:
+        reason = results.get("standard_unknown_reason")
+        if reason:
+            print(f"  MIDI Standard: Unknown ({reason})")
 
     # Timing Information
     print_section("TIMING INFORMATION")
