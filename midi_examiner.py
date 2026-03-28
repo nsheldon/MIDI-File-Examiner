@@ -498,6 +498,7 @@ def analyze_midi_file(filepath):
     # If no standard detected via SysEx, check if file is GM-compatible:
     # all bank selects must use value=0 (base GM range)
     standard_assumed = False
+    standard_assumed_reason = None
     standard_unknown_reason = None
     if detected_standard is None:
         all_gm_banks = all(
@@ -507,6 +508,7 @@ def analyze_midi_file(filepath):
         if all_gm_banks:  # True even when bank_selects is empty
             detected_standard = "GM"
             standard_assumed = True
+            standard_assumed_reason = "no reset SysEx found; all bank selects use GM values"
         else:
             # Build a human-readable reason. Non-zero MSBs are the primary
             # indicator; only fall back to LSBs if all MSBs are zero.
@@ -547,10 +549,22 @@ def analyze_midi_file(filepath):
         )
         if ch10_non_gm:
             detected_standard = "GM2"
+            # Collect the non-GM percussion programs that triggered the upgrade
+            non_gm_kits = sorted({
+                pc["program"]
+                for pc in results["program_changes"]
+                if pc["is_percussion"] and pc["program"] != 0
+            })
+            kit_list = ", ".join(str(p) for p in non_gm_kits)
+            noun = "program" if len(non_gm_kits) == 1 else "programs"
+            standard_assumed_reason = (
+                f"no reset SysEx found; non-GM percussion {noun} on channel 10: {kit_list}"
+            )
 
     # Store detected MIDI standard
     results["detected_standard"] = detected_standard
     results["standard_assumed"] = standard_assumed
+    results["standard_assumed_reason"] = standard_assumed_reason
     results["standard_unknown_reason"] = standard_unknown_reason
 
     # Re-resolve program names now that the final standard is known.
@@ -629,7 +643,11 @@ def print_results(results):
     standard = results.get("detected_standard")
     if standard:
         assumed = results.get("standard_assumed", False)
-        suffix = " (assumed — no reset SysEx found)" if assumed else " (detected via SysEx)"
+        if assumed:
+            reason = results.get("standard_assumed_reason") or "no reset SysEx found"
+            suffix = f" (assumed — {reason})"
+        else:
+            suffix = " (detected via SysEx)"
         print(f"  MIDI Standard: {standard}{suffix}")
     else:
         reason = results.get("standard_unknown_reason")
