@@ -260,6 +260,32 @@ def determine_minimum_sc_version(results):
     }
 
 
+def decode_midi_text(text):
+    """Decode a MIDI meta-message text string to properly-encoded Unicode.
+
+    mido decodes all meta-message text as Latin-1.  Re-encode to the original
+    bytes, then try encodings in order: pure ASCII (if no high bytes), UTF-8,
+    CP932 (Windows Shift-JIS, common in Japanese MIDI files), EUC-JP.
+    Falls back to the original Latin-1 string if nothing else works.
+    """
+    try:
+        raw = text.encode('latin-1')
+    except (UnicodeEncodeError, AttributeError):
+        return text  # already properly decoded or not a string
+
+    # Pure ASCII — no re-encoding needed
+    if all(b < 0x80 for b in raw):
+        return text
+
+    for encoding in ('utf-8', 'cp932', 'euc-jp'):
+        try:
+            return raw.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+
+    return text  # fall back to Latin-1 (original mido behaviour)
+
+
 def analyze_midi_file(filepath):
     """Analyze a MIDI file and return structured data."""
     clipped = False
@@ -354,31 +380,31 @@ def analyze_midi_file(filepath):
 
             # Meta messages
             if msg.type == 'track_name':
-                track_info["name"] = msg.name
+                track_info["name"] = decode_midi_text(msg.name)
                 if track_idx == 0:
-                    results["metadata"]["sequence_name"] = msg.name
+                    results["metadata"]["sequence_name"] = decode_midi_text(msg.name)
 
             elif msg.type == 'copyright':
-                results["metadata"]["copyright"] = msg.text
+                results["metadata"]["copyright"] = decode_midi_text(msg.text)
 
             elif msg.type == 'text':
                 results["text_events"].append({
                     "track": track_idx,
-                    "text": msg.text,
+                    "text": decode_midi_text(msg.text),
                     "abs_time": abs_time
                 })
 
             elif msg.type == 'marker':
                 results["markers"].append({
                     "track": track_idx,
-                    "marker": msg.text,
+                    "marker": decode_midi_text(msg.text),
                     "abs_time": abs_time
                 })
 
             elif msg.type == 'cue_marker':
                 results["cue_points"].append({
                     "track": track_idx,
-                    "cue": msg.text,
+                    "cue": decode_midi_text(msg.text),
                     "abs_time": abs_time
                 })
 
@@ -424,7 +450,7 @@ def analyze_midi_file(filepath):
                     results["metadata"]["instruments"] = []
                 results["metadata"]["instruments"].append({
                     "track": track_idx,
-                    "name": msg.name
+                    "name": decode_midi_text(msg.name)
                 })
 
             elif msg.type == 'lyrics':
@@ -432,7 +458,7 @@ def analyze_midi_file(filepath):
                     results["metadata"]["lyrics"] = []
                 results["metadata"]["lyrics"].append({
                     "track": track_idx,
-                    "text": msg.text,
+                    "text": decode_midi_text(msg.text),
                     "abs_time": abs_time
                 })
 
