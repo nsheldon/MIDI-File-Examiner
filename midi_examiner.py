@@ -342,6 +342,9 @@ def analyze_midi_file(filepath):
     # Track bank select state per channel
     channel_banks = defaultdict(lambda: {"msb": 0, "lsb": 0})
 
+    # Track note-on absolute times per channel (for post-processing)
+    channel_note_ons = defaultdict(list)
+
     # Track detected MIDI standard (GM, GM2, GS, XG)
     detected_standard = None
 
@@ -479,6 +482,10 @@ def analyze_midi_file(filepath):
                     if standard_priority[sysex_type] > current_priority:
                         detected_standard = sysex_type
 
+            # Note-ons: track abs_time per channel for post-processing
+            elif msg.type == 'note_on' and msg.velocity > 0:
+                channel_note_ons[msg.channel + 1].append(abs_time)
+
             # Control changes (Bank Select)
             elif msg.type == 'control_change':
                 if msg.control == 0:  # Bank Select MSB
@@ -488,7 +495,7 @@ def analyze_midi_file(filepath):
                         "channel": msg.channel + 1,
                         "type": "MSB",
                         "value": msg.value,
-                        "time": msg.time
+                        "abs_time": abs_time
                     })
                 elif msg.control == 32:  # Bank Select LSB
                     channel_banks[msg.channel]["lsb"] = msg.value
@@ -497,7 +504,7 @@ def analyze_midi_file(filepath):
                         "channel": msg.channel + 1,
                         "type": "LSB",
                         "value": msg.value,
-                        "time": msg.time
+                        "abs_time": abs_time
                     })
 
             # Program changes
@@ -516,7 +523,7 @@ def analyze_midi_file(filepath):
                     "bank_msb": bank["msb"],
                     "bank_lsb": bank["lsb"],
                     "is_percussion": channel_num == 10,
-                    "time": msg.time
+                    "abs_time": abs_time
                 })
 
         results["tracks"].append(track_info)
@@ -592,6 +599,50 @@ def analyze_midi_file(filepath):
     results["standard_assumed"] = standard_assumed
     results["standard_assumed_reason"] = standard_assumed_reason
     results["standard_unknown_reason"] = standard_unknown_reason
+
+    # Post-process program changes: fix cases where a bank select arrived
+    # AFTER the program change on the same channel.  Some files send the
+    # program change first, then CC0/CC32.  Only apply the bank retroactively
+    # if NO note-on events on that channel occurred between the program change
+    # and the bank select — if notes were played first, the bank select is a
+    # new instrument selection, not a correction to the earlier program change.
+
+    # Build per-channel bank-select timeline: sorted list of
+    # (abs_time, running_msb, running_lsb) after each MSB or LSB event.
+    channel_bs_timeline = defaultdict(list)
+    for ch in set(bs["channel"] for bs in results["bank_selects"]):
+        ch_bss = sorted(
+            (bs for bs in results["bank_selects"] if bs["channel"] == ch),
+            key=lambda b: b["abs_time"]
+        )
+        cur_msb, cur_lsb = 0, 0
+        for bs in ch_bss:
+            if bs["type"] == "MSB":
+                cur_msb = bs["value"]
+            else:
+                cur_lsb = bs["value"]
+            channel_bs_timeline[ch].append((bs["abs_time"], cur_msb, cur_lsb))
+
+    for pc in results["program_changes"]:
+        if pc["bank_msb"] != 0 or pc["bank_lsb"] != 0:
+            continue
+        ch = pc["channel"]
+        if ch not in channel_bs_timeline:
+            continue
+        pc_time = pc["abs_time"]
+        # First bank select strictly after this program change
+        future = [(t, m, l) for (t, m, l) in channel_bs_timeline[ch] if t > pc_time]
+        if not future:
+            continue
+        bs_time, new_msb, new_lsb = future[0]
+        if new_msb == 0 and new_lsb == 0:
+            continue
+        # If any note-on on this channel falls between the program change and
+        # the bank select, the bank select belongs to a new instrument selection.
+        if any(pc_time < t <= bs_time for t in channel_note_ons[ch]):
+            continue
+        pc["bank_msb"] = new_msb
+        pc["bank_lsb"] = new_lsb
 
     # Re-resolve program names now that the final standard is known.
     # Names were looked up during the track loop when detected_standard may

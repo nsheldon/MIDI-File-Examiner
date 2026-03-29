@@ -1998,6 +1998,20 @@ def get_patch_name(bank_msb, bank_lsb, program, standard=None):
             if result:
                 break
 
+        # When no CC32 was sent (bank_lsb=0), the SC generation is unknown.
+        # Try the stated bank_msb with each SC generation LSB (1–4) so that
+        # variation names (e.g. MSB=8 → "Brass 2") are resolved rather than
+        # always falling back to the MSB=0 base patch.
+        if not result and bank_lsb == 0:
+            for gen_lsb in range(1, 5):
+                cursor.execute("""
+                    SELECT name, category FROM patches
+                    WHERE standard = 'GS' AND bank_msb = ? AND bank_lsb = ? AND program = ?
+                """, (bank_msb, gen_lsb, program))
+                result = cursor.fetchone()
+                if result:
+                    break
+
         # Fall back to base GS patch (MSB=0, LSB=1)
         if not result and (bank_msb != 0 or bank_lsb != 1):
             cursor.execute("""
