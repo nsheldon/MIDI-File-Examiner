@@ -253,14 +253,77 @@ INFO_PLIST = """\
 </plist>
 """
 
-LAUNCHER = """\
-#!/bin/bash
-# Auto-generated launcher — re-run create_app.py to update.
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-# MacOS/ -> Contents/ -> .app/ -> project dir
-PROJECT_DIR="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"
-exec {python} "$PROJECT_DIR/midi_examiner_gui.py" "$@"
+# C source for the launcher binary.  A compiled binary (rather than a shell
+# script that exec's Python.app) causes macOS to associate the process with
+# *this* bundle, which is required for Services / Translate to work correctly.
+LAUNCHER_C = r"""
+#include <stdio.h>
+#include <unistd.h>
+#include <stdint.h>
+#include <string.h>
+#include <mach-o/dyld.h>
+
+static const char PYTHON[] = "{python_path}";
+
+int main(int argc, char *argv[]) {{
+    /* Resolve the real path of this binary. */
+    char exe[4096];
+    uint32_t sz = (uint32_t)sizeof(exe);
+    if (_NSGetExecutablePath(exe, &sz) != 0) return 1;
+
+    /*
+     * The binary lives at:  <project>/<App>.app/Contents/MacOS/<App>
+     * The script lives at:  <project>/midi_examiner_gui.py
+     *
+     * Strip three path components after "/MacOS" to reach <project>/:
+     *   1. null-terminate at "/MacOS"  → <project>/<App>.app/Contents
+     *   2. strip "Contents"            → <project>/<App>.app
+     *   3. strip "<App>.app"           → <project>/
+     */
+    char *sep = strstr(exe, "/MacOS/");
+    if (!sep) return 1;
+    *sep = '\0';                        /* exe == .../Contents       */
+
+    char *p = strrchr(exe, '/');        /* slash before "Contents"   */
+    if (!p) return 1;
+    *p = '\0';                          /* exe == .../<App>.app      */
+
+    p = strrchr(exe, '/');              /* slash before "<App>.app"  */
+    if (!p) return 1;
+    p[1] = '\0';                        /* exe == .../Project/       */
+
+    char script[4096];
+    if (snprintf(script, sizeof(script), "%smidi_examiner_gui.py", exe)
+            >= (int)sizeof(script)) return 1;
+
+    char *args[] = {{(char *)PYTHON, script, NULL}};
+    execv(PYTHON, args);
+    return 1;
+}}
 """
+
+
+def _build_launcher_binary(dest_path: str) -> bool:
+    """Compile the C launcher to dest_path using clang.  Returns True on success."""
+    clang = shutil.which("clang")
+    if not clang:
+        return False
+    c_source = LAUNCHER_C.format(python_path=PYTHON_BIN)
+    with tempfile.NamedTemporaryFile(suffix=".c", mode="w", delete=False) as f:
+        f.write(c_source)
+        src = f.name
+    try:
+        result = subprocess.run(
+            [clang, "-arch", "arm64", "-arch", "x86_64", "-o", dest_path, src],
+            capture_output=True, text=True,
+        )
+        if result.returncode != 0:
+            print(f"  clang error: {result.stderr.strip()}")
+            return False
+        os.chmod(dest_path, 0o755)
+        return True
+    finally:
+        os.unlink(src)
 
 
 def build_app() -> None:
@@ -282,16 +345,41 @@ def build_app() -> None:
         f.write(INFO_PLIST.format(version=__version__))
     print(f"  plist → {plist_path}")
 
-    # Launcher script
+    # Launcher — prefer a compiled binary so macOS assigns our bundle identity
+    # (Services / Translate require this).  Fall back to a shell script if
+    # clang is not available.
     launcher_path = os.path.join(macos_dir, APP_NAME)
-    with open(launcher_path, "w") as f:
-        f.write(LAUNCHER.format(python=PYTHON_BIN))
-    os.chmod(launcher_path, 0o755)
-    print(f"  launcher → {launcher_path}")
+    if _build_launcher_binary(launcher_path):
+        print(f"  launcher (binary) → {launcher_path}")
+    else:
+        print("  clang not found — falling back to shell script launcher")
+        print("  NOTE: Services / Translate may not work in the shell-script build.")
+        script = (
+            "#!/bin/bash\n"
+            "# Auto-generated launcher — re-run create_app.py to update.\n"
+            'SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"\n'
+            'PROJECT_DIR="$(dirname "$(dirname "$(dirname "$SCRIPT_DIR")")")"\n'
+            f'exec {PYTHON_BIN} "$PROJECT_DIR/midi_examiner_gui.py" "$@"\n'
+        )
+        with open(launcher_path, "w") as f:
+            f.write(script)
+        os.chmod(launcher_path, 0o755)
+        print(f"  launcher (script) → {launcher_path}")
 
     # Icon
     icns_path = os.path.join(resources_dir, "AppIcon.icns")
     build_icns(icns_path)
+
+    # Ad-hoc code signature — required for macOS to launch an unsigned compiled
+    # binary inside an app bundle.  --force re-signs if already signed.
+    result = subprocess.run(
+        ["codesign", "--sign", "-", "--force", "--deep", APP_BUNDLE],
+        capture_output=True, text=True,
+    )
+    if result.returncode == 0:
+        print(f"  signed  → {APP_BUNDLE} (ad-hoc)")
+    else:
+        print(f"  codesign failed: {result.stderr.strip()}")
 
     print(f"\nDone: {APP_BUNDLE}")
 

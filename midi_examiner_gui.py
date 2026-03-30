@@ -14,7 +14,7 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget,
         QVBoxLayout, QHBoxLayout,
-        QPushButton, QLineEdit, QTextEdit, QFileDialog, QTabWidget,
+        QPushButton, QLineEdit, QTextEdit, QFileDialog, QTabWidget, QMenu,
     )
     from PyQt6.QtGui import (QFont, QKeySequence, QAction,
                               QDragEnterEvent, QDropEvent,
@@ -45,6 +45,482 @@ _TAB_LABELS = {
     "PROGRAM CHANGES": "Programs",
     "CONTROL CHANGES": "Control Changes",
 }
+
+
+# ── macOS Services integration ────────────────────────────────────────────────
+#
+# Qt's QTextEdit uses a custom QNSView (not NSTextView) which does not
+# implement NSServicesMenuRequestor.  Without that protocol macOS never
+# populates the Services menu for our view, so NSApp.servicesMenu() always
+# returns 0 items.
+#
+# We fix this by ISA-swizzling each viewport NSView at creation time:
+#   1. Allocate a new ObjC class that inherits from the existing view class.
+#   2. Add writeSelectionToPasteboard:types: and validRequestorForSendType:
+#      returnType: that delegate back to the Python QTextEdit instance.
+#   3. Swap the view's isa pointer to the new class (object_setClass).
+#   4. Register our app's send types with NSApp so macOS populates the menu.
+#
+# After this, NSApp.servicesMenu() returns the real system services for text,
+# and we enumerate them to build the right-click Services submenu.
+
+import weakref as _weakref
+
+# Keep C-function-pointer IMPs alive (they must not be GC'd)
+_svc_imp_refs: list = []
+# Map NSView* (int) → weakref(QTextEdit)
+_svc_view_map: dict = {}
+# Map base_class pointer → new services-enabled class pointer
+_svc_class_cache: dict = {}
+
+
+def _objc_lib():
+    import ctypes, ctypes.util
+    lib = ctypes.cdll.LoadLibrary(ctypes.util.find_library('objc'))
+    lib.sel_registerName.restype = ctypes.c_void_p
+    lib.sel_registerName.argtypes = [ctypes.c_char_p]
+    lib.objc_getClass.restype  = ctypes.c_void_p
+    lib.objc_getClass.argtypes = [ctypes.c_char_p]
+    return lib
+
+
+def _setup_services_menu():
+    """Create an NSMenu, set it as the app Services menu, and ask pbs to populate it.
+
+    Qt never calls -[NSApplication setServicesMenu:], so NSApp.servicesMenu
+    returns nil and pbs never populates the menu with text services such as
+    Translate or Look Up.  This function fixes that once at app startup.
+    """
+    try:
+        import ctypes, ctypes.util
+        lib = _objc_lib()
+
+        def SEL(n):
+            return lib.sel_registerName(n if isinstance(n, bytes) else n.encode())
+
+        def msg0(obj, sel):
+            lib.objc_msgSend.restype  = ctypes.c_void_p
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            return lib.objc_msgSend(obj, SEL(sel))
+
+        def msg1(obj, sel, a):
+            lib.objc_msgSend.restype  = ctypes.c_void_p
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+            return lib.objc_msgSend(obj, SEL(sel), a)
+
+        def msg2(obj, sel, a, b):
+            lib.objc_msgSend.restype  = ctypes.c_void_p
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                          ctypes.c_void_p, ctypes.c_void_p]
+            return lib.objc_msgSend(obj, SEL(sel), a, b)
+
+        def nsstr(s):
+            lib.objc_msgSend.restype  = ctypes.c_void_p
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
+            return lib.objc_msgSend(lib.objc_getClass(b'NSString'),
+                                    SEL(b'stringWithUTF8String:'), s.encode('utf-8'))
+
+        NSApp = msg0(lib.objc_getClass(b'NSApplication'), b'sharedApplication')
+        if not NSApp:
+            return
+
+        # Only set up once — if a services menu is already set, we're done.
+        if msg0(NSApp, b'servicesMenu'):
+            return
+
+        # Create a new NSMenu (retain count = 1, we own it).
+        NSMenu_cls = lib.objc_getClass(b'NSMenu')
+        alloc = msg0(NSMenu_cls, b'alloc')
+        if not alloc:
+            return
+        svc_menu = msg0(alloc, b'init')
+        if not svc_menu:
+            return
+
+        # Hand it to NSApp — NSApp retains it (retain count becomes 2).
+        msg1(NSApp, b'setServicesMenu:', svc_menu)
+
+        # Release our ownership so retain count is 1 (held by NSApp only).
+        msg0(svc_menu, b'release')
+
+        # Register both UTI and legacy pasteboard types so all text services
+        # (including "Look Up in Dictionary" which only accepts NSStringPboardType)
+        # appear in the Services menu.
+        NSMutableArray_cls = lib.objc_getClass(b'NSMutableArray')
+        arr = msg0(NSMutableArray_cls, b'array')
+        msg1(arr, b'addObject:', nsstr('public.utf8-plain-text'))
+        msg1(arr, b'addObject:', nsstr('NSStringPboardType'))
+        msg2(NSApp, b'registerServicesMenuSendTypes:returnTypes:', arr, arr)
+
+        # Ask pbs to rebuild the services registry and populate our menu.
+        ctypes.cdll.LoadLibrary(ctypes.util.find_library('AppKit')).NSUpdateDynamicServices()
+    except Exception:
+        pass
+
+
+def _make_services_class(lib, base_class):
+    """Build (once per base class) an ObjC subclass with NSServicesMenuRequestor."""
+    import ctypes
+    if base_class in _svc_class_cache:
+        return _svc_class_cache[base_class]
+
+    def SEL(n):
+        return lib.sel_registerName(n if isinstance(n, bytes) else n.encode())
+
+    def nsstr(s):
+        lib.objc_msgSend.restype = ctypes.c_void_p
+        lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
+        return lib.objc_msgSend(lib.objc_getClass(b'NSString'),
+                                SEL(b'stringWithUTF8String:'), s.encode('utf-8'))
+
+    def msg1(obj, sel, a):
+        lib.objc_msgSend.restype = ctypes.c_void_p
+        lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        return lib.objc_msgSend(obj, SEL(sel), a)
+
+    def msg2(obj, sel, a, b):
+        lib.objc_msgSend.restype = ctypes.c_void_p
+        lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                      ctypes.c_void_p, ctypes.c_void_p]
+        return lib.objc_msgSend(obj, SEL(sel), a, b)
+
+    # --- validRequestorForSendType:returnType: ---
+    # Returns self when sendType is plain-text (we can provide it), else nil.
+    VALID_T = ctypes.CFUNCTYPE(ctypes.c_void_p,
+                               ctypes.c_void_p, ctypes.c_void_p,
+                               ctypes.c_void_p, ctypes.c_void_p)
+
+    def _valid_requestor(self_ptr, _cmd, send_type, return_type):
+        if send_type:
+            lib.objc_msgSend.restype = ctypes.c_char_p
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            cs = lib.objc_msgSend(send_type, SEL(b'UTF8String'))
+            lib.objc_msgSend.restype = ctypes.c_void_p
+            if cs and b'utf8-plain-text' in cs:
+                ref = _svc_view_map.get(self_ptr)
+                if ref:
+                    w = ref()
+                    if w and w.textCursor().hasSelection():
+                        return self_ptr
+        return 0
+
+    valid_imp = VALID_T(_valid_requestor)
+
+    # --- writeSelectionToPasteboard:types: ---
+    # Writes the current selection to the pasteboard so the service can read it.
+    WRITE_T = ctypes.CFUNCTYPE(ctypes.c_bool,
+                               ctypes.c_void_p, ctypes.c_void_p,
+                               ctypes.c_void_p, ctypes.c_void_p)
+
+    def _write_selection(self_ptr, _cmd, pboard, types):
+        ref = _svc_view_map.get(self_ptr)
+        if not ref:
+            return False
+        w = ref()
+        if not w:
+            return False
+        text = w.textCursor().selectedText()
+        if not text:
+            return False
+        # Declare both the modern UTI and the legacy NSStringPboardType so that
+        # services like "Look Up in Dictionary" (which only accepts the legacy
+        # NSStringPboardType) can read the pasteboard.
+        type_uti    = nsstr('public.utf8-plain-text')
+        type_legacy = nsstr('NSStringPboardType')
+        NSMutableArray_cls = lib.objc_getClass(b'NSMutableArray')
+        lib.objc_msgSend.restype  = ctypes.c_void_p
+        lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        alloc = lib.objc_msgSend(NSMutableArray_cls, SEL(b'alloc'))
+        arr   = lib.objc_msgSend(alloc,              SEL(b'init'))
+        lib.objc_msgSend.restype  = ctypes.c_void_p
+        lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        lib.objc_msgSend(arr, SEL(b'addObject:'), type_uti)
+        lib.objc_msgSend(arr, SEL(b'addObject:'), type_legacy)
+        msg2(pboard, b'declareTypes:owner:', arr, None)
+        msg2(pboard, b'setString:forType:', nsstr(text), type_uti)
+        msg2(pboard, b'setString:forType:', nsstr(text), type_legacy)
+        lib.objc_msgSend.restype  = ctypes.c_void_p
+        lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.objc_msgSend(arr, SEL(b'release'))
+        return True
+
+    write_imp = WRITE_T(_write_selection)
+    _svc_imp_refs.extend([valid_imp, write_imp])  # prevent GC
+
+    # Allocate new class
+    lib.objc_allocateClassPair.restype  = ctypes.c_void_p
+    lib.objc_allocateClassPair.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_ulong]
+    class_name = f'_METextView_{base_class}'.encode()
+    new_cls = lib.objc_allocateClassPair(base_class, class_name, 0)
+    if not new_cls:
+        # Already registered — get existing
+        new_cls = lib.objc_getClass(class_name)
+        _svc_class_cache[base_class] = new_cls
+        return new_cls
+
+    lib.class_addMethod.restype  = ctypes.c_bool
+    lib.class_addMethod.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                     ctypes.c_void_p, ctypes.c_char_p]
+    lib.class_addMethod(new_cls, SEL(b'validRequestorForSendType:returnType:'),
+                        valid_imp, b'@@:@@')
+    lib.class_addMethod(new_cls, SEL(b'writeSelectionToPasteboard:types:'),
+                        write_imp, b'B@:@@')
+
+    lib.objc_registerClassPair.argtypes = [ctypes.c_void_p]
+    lib.objc_registerClassPair(new_cls)
+
+    _svc_class_cache[base_class] = new_cls
+    return new_cls
+
+
+def _register_view_for_services(widget):
+    """ISA-swizzle the viewport NSView so macOS recognises it as a text provider."""
+    try:
+        import ctypes
+        lib = _objc_lib()
+        lib.object_getClass.restype  = ctypes.c_void_p
+        lib.object_getClass.argtypes = [ctypes.c_void_p]
+        lib.object_setClass.restype  = ctypes.c_void_p
+        lib.object_setClass.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+
+        ns_view    = int(widget.viewport().winId())
+        base_class = lib.object_getClass(ns_view)
+        new_cls    = _make_services_class(lib, base_class)
+        if not new_cls:
+            return
+        lib.object_setClass(ns_view, new_cls)
+        _svc_view_map[ns_view] = _weakref.ref(widget)
+    except Exception:
+        pass
+
+
+def _open_translation(text):
+    """Open macOS system translation for the given text.
+
+    On macOS 12+, "Translate" is a built-in NSTextView feature (not a
+    traditional NSService), so it never appears in the pbs Services menu.
+    We invoke it by sending _translate: through the responder chain; if
+    nothing handles it we fall back to opening Translate.app (if present)
+    or the system browser.
+    """
+    import subprocess, urllib.parse
+    try:
+        import ctypes, ctypes.util
+        lib = _objc_lib()
+
+        def SEL(n):
+            return lib.sel_registerName(n if isinstance(n, bytes) else n.encode())
+
+        lib.objc_msgSend.restype  = ctypes.c_void_p
+        lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        NSApp = lib.objc_msgSend(lib.objc_getClass(b'NSApplication'),
+                                 SEL(b'sharedApplication'))
+
+        # Try sendAction:_translate:to:from: — works if an NSTextView is in
+        # the responder chain on macOS 12+.
+        lib.objc_msgSend.restype  = ctypes.c_bool
+        lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                      ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        handled = lib.objc_msgSend(NSApp,
+                                   SEL(b'sendAction:to:from:'),
+                                   SEL(b'_translate:'),
+                                   None, None)
+        lib.objc_msgSend.restype  = ctypes.c_void_p
+        if handled:
+            return
+    except Exception:
+        pass
+
+    # Fallback: try to open Translate.app directly.
+    r = subprocess.run(['open', '-Ra', 'Translate'], capture_output=True)
+    if r.returncode == 0:
+        # Put text on the general pasteboard so Translate.app can read it.
+        proc = subprocess.Popen(['pbcopy'], stdin=subprocess.PIPE)
+        proc.communicate(text.encode('utf-8'))
+        subprocess.Popen(['open', '-a', 'Translate'])
+        return
+
+    # Final fallback: open in the default browser.
+    import webbrowser
+    url = 'https://translate.google.com/?text=' + urllib.parse.quote(text) + '&sl=auto'
+    webbrowser.open(url)
+
+
+def _perform_service(service_name, text):
+    """Invoke a named macOS Service with the given text on a private pasteboard."""
+    try:
+        import ctypes, ctypes.util
+        lib = _objc_lib()
+
+        def SEL(n):
+            return lib.sel_registerName(n if isinstance(n, bytes) else n.encode())
+
+        def nsstr(s):
+            lib.objc_msgSend.restype  = ctypes.c_void_p
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_char_p]
+            return lib.objc_msgSend(lib.objc_getClass(b'NSString'),
+                                    SEL(b'stringWithUTF8String:'), s.encode('utf-8'))
+
+        def msg0(obj, sel):
+            lib.objc_msgSend.restype  = ctypes.c_void_p
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            return lib.objc_msgSend(obj, SEL(sel))
+
+        def msg1(obj, sel, a):
+            lib.objc_msgSend.restype  = ctypes.c_void_p
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+            return lib.objc_msgSend(obj, SEL(sel), a)
+
+        def msg2(obj, sel, a, b):
+            lib.objc_msgSend.restype  = ctypes.c_void_p
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                          ctypes.c_void_p, ctypes.c_void_p]
+            return lib.objc_msgSend(obj, SEL(sel), a, b)
+
+        pb = msg0(lib.objc_getClass(b'NSPasteboard'), b'pasteboardWithUniqueName')
+
+        # Declare both the modern UTI and the legacy NSStringPboardType so that
+        # services like "Look Up in Dictionary" (which only accepts the legacy
+        # NSStringPboardType) can read the pasteboard.
+        type_uti    = nsstr('public.utf8-plain-text')
+        type_legacy = nsstr('NSStringPboardType')
+        lib.objc_msgSend.restype  = ctypes.c_void_p
+        lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        alloc = lib.objc_msgSend(lib.objc_getClass(b'NSMutableArray'), SEL(b'alloc'))
+        arr   = lib.objc_msgSend(alloc, SEL(b'init'))
+        lib.objc_msgSend.restype  = ctypes.c_void_p
+        lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+        lib.objc_msgSend(arr, SEL(b'addObject:'), type_uti)
+        lib.objc_msgSend(arr, SEL(b'addObject:'), type_legacy)
+        msg2(pb, b'declareTypes:owner:', arr, None)
+        msg2(pb, b'setString:forType:', nsstr(text), type_uti)
+        msg2(pb, b'setString:forType:', nsstr(text), type_legacy)
+        lib.objc_msgSend.restype  = ctypes.c_void_p
+        lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        lib.objc_msgSend(arr, SEL(b'release'))
+
+        appkit = ctypes.cdll.LoadLibrary(ctypes.util.find_library('AppKit'))
+        appkit.NSPerformService.restype  = ctypes.c_bool
+        appkit.NSPerformService.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        appkit.NSPerformService(nsstr(service_name), pb)
+    except Exception:
+        pass
+
+
+def _build_services_submenu(parent_menu, selected_text):
+    """Append the populated macOS Services submenu to parent_menu."""
+    try:
+        import ctypes, ctypes.util
+        lib = _objc_lib()
+
+        def SEL(n):
+            return lib.sel_registerName(n if isinstance(n, bytes) else n.encode())
+
+        def py_str(ns):
+            if not ns:
+                return ''
+            lib.objc_msgSend.restype  = ctypes.c_char_p
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            r = lib.objc_msgSend(ns, SEL(b'UTF8String'))
+            lib.objc_msgSend.restype  = ctypes.c_void_p
+            return r.decode('utf-8') if r else ''
+
+        def msg0(obj, sel):
+            lib.objc_msgSend.restype  = ctypes.c_void_p
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            return lib.objc_msgSend(obj, SEL(sel))
+
+        def msg_long(obj, sel):
+            lib.objc_msgSend.restype  = ctypes.c_long
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            r = lib.objc_msgSend(obj, SEL(sel))
+            lib.objc_msgSend.restype  = ctypes.c_void_p
+            return r
+
+        def msg_bool(obj, sel):
+            lib.objc_msgSend.restype  = ctypes.c_bool
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+            r = lib.objc_msgSend(obj, SEL(sel))
+            lib.objc_msgSend.restype  = ctypes.c_void_p
+            return bool(r)
+
+        def msg_idx(obj, sel, i):
+            lib.objc_msgSend.restype  = ctypes.c_void_p
+            lib.objc_msgSend.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
+            return lib.objc_msgSend(obj, SEL(sel), ctypes.c_long(i))
+
+        NSApp    = msg0(lib.objc_getClass(b'NSApplication'), b'sharedApplication')
+        svc_menu = msg0(NSApp, b'servicesMenu')
+        if not svc_menu or msg_long(svc_menu, b'numberOfItems') == 0:
+            return
+
+        parent_menu.addSeparator()
+        sub = QMenu("Services", parent_menu)
+
+        def populate(qt_menu, ns_menu):
+            for i in range(msg_long(ns_menu, b'numberOfItems')):
+                item = msg_idx(ns_menu, b'itemAtIndex:', i)
+                if msg_bool(item, b'isSeparatorItem'):
+                    qt_menu.addSeparator()
+                    continue
+                title    = py_str(msg0(item, b'title'))
+                submenu  = msg0(item, b'submenu')
+                if submenu and msg_long(submenu, b'numberOfItems') > 0:
+                    child = QMenu(title, qt_menu)
+                    populate(child, submenu)
+                    if not child.isEmpty():
+                        qt_menu.addMenu(child)
+                else:
+                    act = qt_menu.addAction(title)
+                    act.triggered.connect(
+                        lambda checked=False, svc=title, txt=selected_text:
+                            _perform_service(svc, txt)
+                    )
+
+        populate(sub, svc_menu)
+        if not sub.isEmpty():
+            parent_menu.addMenu(sub)
+    except Exception:
+        pass
+
+
+class ServiceAwareTextEdit(QTextEdit):
+    """Read-only QTextEdit with macOS Services (Translate, Look Up, etc.) support.
+
+    On macOS the underlying QNSView is ISA-swizzled at creation time to
+    implement NSServicesMenuRequestor, which is required for macOS to
+    populate NSApp.servicesMenu() with text services.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # Defer swizzle until the native NSView exists (after show)
+        QTimer.singleShot(0, lambda: _register_view_for_services(self))
+
+    def contextMenuEvent(self, event):
+        menu = self.createStandardContextMenu()
+        selected = self.textCursor().selectedText()
+        if selected:
+            menu.addSeparator()
+
+            # "Translate" is a built-in NSTextView feature on macOS 12+, not a
+            # traditional NSService, so it never appears in the pbs Services
+            # menu.  Add it as a direct item instead.
+            tr_action = menu.addAction("Translate")
+            tr_action.triggered.connect(
+                lambda checked=False, t=selected: _open_translation(t)
+            )
+
+            # "Look Up in Dictionary" IS a registered service but requires
+            # NSStringPboardType.  Expose it directly so it always appears.
+            lu_action = menu.addAction("Look Up in Dictionary")
+            lu_action.triggered.connect(
+                lambda checked=False, t=selected:
+                    _perform_service("Look Up in Dictionary", t)
+            )
+
+            _build_services_submenu(menu, selected)
+        menu.exec(event.globalPos())
 
 
 def _split_sections(text):
@@ -236,8 +712,8 @@ class MidiExaminerWindow(QMainWindow):
         file_menu.addAction(quit_action)
 
     def _make_text_view(self):
-        """Create a styled read-only monospace QTextEdit for a section tab."""
-        view = QTextEdit()
+        """Create a styled read-only monospace text view for a section tab."""
+        view = ServiceAwareTextEdit()
         view.setReadOnly(True)
         font = QFont("Menlo")
         if not font.exactMatch():
@@ -337,6 +813,11 @@ def main():
     app = MidiApplication(sys.argv)
     app.setApplicationName("MIDI File Examiner")
     app.setApplicationVersion(__version__)
+
+    # On macOS, set up the Services menu so pbs can populate it with text
+    # services (Translate, Look Up, etc.).  Qt never does this itself.
+    if sys.platform == 'darwin':
+        _setup_services_menu()
 
     window = MidiExaminerWindow()
     app.set_window(window)
