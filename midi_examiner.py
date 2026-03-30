@@ -15,7 +15,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.0.0-beta.9"
+__version__ = "1.0.0-beta.10"
 
 # Import the database module for patch lookups
 import midi_patches_db
@@ -217,6 +217,8 @@ def determine_minimum_sc_version(results):
     max_generation = 1  # Default to SC-55 (generation 1)
     uses_cm64_pcm = False
     uses_cm64_la = False
+    # Track patches that require each generation (gen -> set of name strings)
+    generation_reasons = {2: set(), 3: set(), 4: set()}
 
     for pc in results["program_changes"]:
         msb = pc["bank_msb"]
@@ -232,15 +234,15 @@ def determine_minimum_sc_version(results):
             continue
 
         if is_percussion:
-            # Find the minimum bank_lsb that has this drum kit
+            # Find the minimum bank_lsb that has this drum kit, plus its name
             cursor.execute("""
-                SELECT MIN(bank_lsb) FROM percussion_sets
+                SELECT MIN(bank_lsb), name FROM percussion_sets
                 WHERE standard = 'GS' AND bank_msb = 0 AND program = ?
             """, (program,))
         else:
-            # Find the minimum bank_lsb that has this (msb, program) combo
+            # Find the minimum bank_lsb that has this (msb, program) combo, plus its name
             cursor.execute("""
-                SELECT MIN(bank_lsb) FROM patches
+                SELECT MIN(bank_lsb), name FROM patches
                 WHERE standard = 'GS' AND bank_msb = ? AND program = ?
             """, (msb, program))
 
@@ -249,12 +251,28 @@ def determine_minimum_sc_version(results):
             min_lsb = row[0]
             if min_lsb > max_generation:
                 max_generation = min_lsb
+            if min_lsb >= 2:
+                patch_name = row[1] if row[1] else pc.get("program_name", f"Program {program}")
+                if min_lsb in generation_reasons:
+                    generation_reasons[min_lsb].add(patch_name)
 
     conn.close()
+
+    # Build reason string: list the patches that require the minimum version
+    reason = ""
+    if max_generation >= 2:
+        # Collect patches that require exactly the minimum generation (the tightest constraint)
+        culprit_patches = generation_reasons.get(max_generation, set())
+        if culprit_patches:
+            patch_list = ", ".join(sorted(culprit_patches)[:3])
+            if len(culprit_patches) > 3:
+                patch_list += f" (+{len(culprit_patches) - 3} more)"
+            reason = f"uses {SC_GENERATIONS[max_generation]}-exclusive patch(es): {patch_list}"
 
     return {
         "minimum_sc_version": SC_GENERATIONS.get(max_generation, f"Unknown ({max_generation})"),
         "minimum_sc_generation": max_generation,
+        "minimum_sc_reason": reason,
         "uses_cm64_pcm": uses_cm64_pcm,
         "uses_cm64_la": uses_cm64_la,
     }
@@ -869,7 +887,10 @@ def print_results(results):
         if "gs_info" in results:
             gs = results["gs_info"]
             print_subsection("Roland GS Requirements")
-            print(f"  Minimum SC version:   {gs['minimum_sc_version']}")
+            sc_line = f"  Minimum SC version:   {gs['minimum_sc_version']}"
+            if gs.get("minimum_sc_reason"):
+                sc_line += f" ({gs['minimum_sc_reason']})"
+            print(sc_line)
             if gs["uses_cm64_pcm"]:
                 print(f"  CM-64 PCM patches:    Yes (MSB 126)")
             if gs["uses_cm64_la"]:
