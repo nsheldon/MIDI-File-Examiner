@@ -15,7 +15,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.0.0-beta.12"
+__version__ = "1.0.0-beta.13"
 
 # Import the database module for patch lookups
 import midi_patches_db
@@ -253,7 +253,7 @@ def determine_minimum_xg_level(results):
             if msb == 48:
                 if max_level < 2:
                     max_level = 2
-                name = pc.get("program_name") or f"Model Exclusive pgm {program}"
+                name = pc.get("program_name") or f"Bank {msb}:{lsb} Pgm {program+1}"
                 level_reasons[2].add(name)
                 continue
 
@@ -272,10 +272,10 @@ def determine_minimum_xg_level(results):
                     if lvl > max_level:
                         max_level = lvl
                     if lvl >= 2:
-                        level_reasons[lvl].add(name or f"LSB{lsb} pgm{program+1}")
+                        level_reasons[lvl].add(name or f"Bank {msb}:{lsb} Pgm {program+1}")
                 else:
                     # Unlisted voice in Other Waves bank — Level 2 by bank heuristic
-                    level_reasons[2].add(f"Bank LSB{lsb} pgm{program+1}")
+                    level_reasons[2].add(f"Bank {msb}:{lsb} Pgm {program+1}")
                 continue
 
             # Standard XG banks (MSB=0, LSB=0-63): look up in database
@@ -289,7 +289,7 @@ def determine_minimum_xg_level(results):
                 if lvl > max_level:
                     max_level = lvl
                 if lvl >= 2:
-                    level_reasons[lvl].add(name or f"LSB{lsb} pgm{program+1}")
+                    level_reasons[lvl].add(name or f"Bank {msb}:{lsb} Pgm {program+1}")
 
     conn.close()
 
@@ -669,6 +669,8 @@ def analyze_midi_file(filepath):
     standard_assumed = False
     standard_assumed_reason = None
     standard_unknown_reason = None
+    standard_upgraded_from = None   # set when GM→GM2 upgrade happens
+    standard_upgrade_reason = None
     if detected_standard is None:
         all_gm_banks = all(
             bs["value"] == 0
@@ -717,8 +719,6 @@ def analyze_midi_file(filepath):
             if pc["is_percussion"]
         )
         if ch10_non_gm:
-            detected_standard = "GM2"
-            # Collect the non-GM percussion programs that triggered the upgrade
             non_gm_kits = sorted({
                 pc["program"]
                 for pc in results["program_changes"]
@@ -726,15 +726,52 @@ def analyze_midi_file(filepath):
             })
             kit_list = ", ".join(str(p) for p in non_gm_kits)
             noun = "program" if len(non_gm_kits) == 1 else "programs"
-            standard_assumed_reason = (
-                f"no reset SysEx found; non-GM percussion {noun} on channel 10: {kit_list}"
-            )
+            upgrade_reason = f"GM2-only percussion {noun} on channel 10: {kit_list}"
+            if standard_assumed:
+                # GM was itself assumed (no SysEx); keep assumed path
+                standard_assumed_reason = (
+                    f"no reset SysEx found; non-GM percussion {noun} on channel 10: {kit_list}"
+                )
+            else:
+                # GM was confirmed via SysEx; record the upgrade separately
+                standard_upgraded_from = "GM"
+                standard_upgrade_reason = upgrade_reason
+            detected_standard = "GM2"
 
     # Store detected MIDI standard
     results["detected_standard"] = detected_standard
     results["standard_assumed"] = standard_assumed
     results["standard_assumed_reason"] = standard_assumed_reason
     results["standard_unknown_reason"] = standard_unknown_reason
+    results["standard_upgraded_from"] = standard_upgraded_from
+    results["standard_upgrade_reason"] = standard_upgrade_reason
+
+    # Detect Soft Karaoke (KAR) format: look for the canonical @KMIDI marker
+    # in text events.  Collect @KV version, @T titles, @L language, @I info.
+    kar_version = None
+    kar_titles = []
+    kar_languages = []
+    kar_info = []
+    is_karaoke = False
+    for evt in results["text_events"]:
+        t = evt["text"].strip()
+        if t == "@KMIDI KARAOKE FILE":
+            is_karaoke = True
+        elif t.startswith("@KV"):
+            kar_version = t[3:].strip()
+        elif t.startswith("@T"):
+            kar_titles.append(t[2:].strip())
+        elif t.startswith("@L"):
+            kar_languages.append(t[2:].strip())
+        elif t.startswith("@I"):
+            kar_info.append(t[2:].strip())
+    results["karaoke"] = {
+        "is_karaoke": is_karaoke,
+        "version": kar_version,
+        "titles": kar_titles,
+        "languages": kar_languages,
+        "info": kar_info,
+    } if is_karaoke else None
 
     # Post-process program changes: fix cases where a bank select arrived
     # AFTER the program change on the same channel.  Some files send the
@@ -791,6 +828,27 @@ def analyze_midi_file(filepath):
             detected_standard
         )
 
+    # For GM/GM2: if a channel has note-ons but no program change, it uses the
+    # default program 0 on bank 0:0.  Add a synthetic entry so the channel
+    # appears in the Program output.
+    if detected_standard in ("GM", "GM2"):
+        channels_with_pc = {pc["channel"] for pc in results["program_changes"]}
+        for ch, note_times in sorted(channel_note_ons.items()):
+            if note_times and ch not in channels_with_pc:
+                results["program_changes"].append({
+                    "track": 0,
+                    "channel": ch,
+                    "program": 0,
+                    "program_name": get_instrument_name(
+                        0, ch, 0, 0, detected_standard
+                    ),
+                    "bank_msb": 0,
+                    "bank_lsb": 0,
+                    "is_percussion": ch == 10,
+                    "abs_time": note_times[0],
+                    "assumed": True,
+                })
+
     # For XG: Bank Select MSB 127 designates any channel as a rhythm/percussion
     # channel, not just channel 10. MSB 126 is the SFX kit, also rhythm-arranged.
     # Apply this after standard is finalized and names are re-resolved.
@@ -837,6 +895,58 @@ def print_subsection(title):
     print(f"\n--- {title} ---")
 
 
+def _karaoke_lyric_texts(text_events):
+    """Return sanitized text strings from the karaoke lyrics track(s).
+
+    Only includes events from tracks that contain at least one syllable with a
+    \\ or / line-break prefix; filters out @-prefixed karaoke metadata lines.
+    This avoids mixing in unrelated text events (e.g. sequencer credits) that
+    happen to sit in non-karaoke tracks of the same file.
+    """
+    lyric_tracks = {
+        e["track"] for e in text_events
+        if sanitize_text(e["text"]).startswith("\\") or sanitize_text(e["text"]).startswith("/")
+    }
+    return [
+        sanitize_text(e["text"]) for e in text_events
+        if e["track"] in lyric_tracks and not sanitize_text(e["text"]).startswith("@")
+    ]
+
+
+def _assemble_karaoke_lines(raw_texts):
+    """Assemble a list of raw karaoke syllable strings into (is_para, line) pairs.
+
+    Syllables starting with \\ begin a new paragraph (blank line before);
+    syllables starting with / begin a new line within a paragraph.
+    Returns a list of (is_paragraph_break, assembled_line) tuples, or an
+    empty list if no line-break markers are present.
+    """
+    if not any(t.startswith("\\") or t.startswith("/") for t in raw_texts):
+        return []
+    lines = []
+    current = ""
+    first = True
+    for text in raw_texts:
+        if text.startswith("\\") or text.startswith("/"):
+            if current.strip() or not first:
+                lines.append((text.startswith("\\"), current.rstrip()))
+            current = text[1:]
+            first = False
+        else:
+            current += text
+    if current.strip():
+        lines.append((False, current.rstrip()))
+    return lines
+
+
+def _print_karaoke_lines(lines):
+    """Print assembled karaoke lines, inserting blank lines before paragraphs."""
+    for i, (is_para, line) in enumerate(lines):
+        if is_para and i > 0:
+            print()
+        print(f"  {line}")
+
+
 def print_results(results):
     """Print the analysis results in a readable format."""
 
@@ -860,9 +970,13 @@ def print_results(results):
     standard = results.get("detected_standard")
     if standard:
         assumed = results.get("standard_assumed", False)
+        upgraded_from = results.get("standard_upgraded_from")
         if assumed:
             reason = results.get("standard_assumed_reason") or "no reset SysEx found"
             suffix = f" (assumed — {reason})"
+        elif upgraded_from:
+            upgrade_reason = results.get("standard_upgrade_reason", "")
+            suffix = f" ({upgraded_from} detected via SysEx; {upgrade_reason})"
         else:
             suffix = " (detected via SysEx)"
         print(f"  MIDI Standard: {standard}{suffix}")
@@ -886,6 +1000,16 @@ def print_results(results):
         reason = results.get("standard_unknown_reason")
         if reason:
             print(f"  MIDI Standard: Unknown ({reason})")
+    if results.get("karaoke"):
+        kar = results["karaoke"]
+        ver = f" v{kar['version']}" if kar.get("version") else ""
+        print(f"  Karaoke:       Soft Karaoke (KAR) format{ver}")
+        if kar["titles"]:
+            print(f"  KAR Title:     {', '.join(kar['titles'])}")
+        if kar["languages"]:
+            print(f"  KAR Language:  {', '.join(kar['languages'])}")
+        if kar["info"]:
+            print(f"  KAR Info:      {'; '.join(kar['info'])}")
 
     # Timing Information
     print_section("TIMING INFORMATION")
@@ -973,13 +1097,29 @@ def print_results(results):
             pos = format_position(cue['abs_time'], ppqn, time_sigs_abs)
             print(f"  Track {cue['track']}: \"{sanitize_text(cue['cue'])}\" at {pos}")
 
-    # Lyrics
+    # Lyrics from MIDI lyrics events
     if "lyrics" in results["metadata"] and results["metadata"]["lyrics"]:
         print_section("LYRICS")
-        for lyric in results["metadata"]["lyrics"][:20]:
-            print(f"  \"{sanitize_text(lyric['text'])}\"")
-        if len(results["metadata"]["lyrics"]) > 20:
-            print(f"  ... and {len(results['metadata']['lyrics']) - 20} more lyrics")
+        raw_texts = [sanitize_text(l["text"]) for l in results["metadata"]["lyrics"]]
+        lines = _assemble_karaoke_lines(raw_texts)
+        if not lines:
+            # Lyrics events lack break markers; try text events for assembly
+            kar_texts = _karaoke_lyric_texts(results["text_events"])
+            lines = _assemble_karaoke_lines(kar_texts)
+        if lines:
+            _print_karaoke_lines(lines)
+        else:
+            for lyric in results["metadata"]["lyrics"]:
+                print(f"  {sanitize_text(lyric['text'])}")
+
+    # Lyrics assembled from text events (Soft Karaoke files that store lyrics
+    # only as text events rather than MIDI lyrics events)
+    elif results.get("karaoke"):
+        kar_texts = _karaoke_lyric_texts(results["text_events"])
+        lines = _assemble_karaoke_lines(kar_texts)
+        if lines:
+            print_section("LYRICS (FROM TEXT EVENTS)")
+            _print_karaoke_lines(lines)
 
     # SysEx Messages
     print_section("SYSTEM EXCLUSIVE (SYSEX) MESSAGES")
@@ -1063,7 +1203,8 @@ def print_results(results):
                     bank_info = ""
                     if pc["bank_msb"] != 0 or pc["bank_lsb"] != 0:
                         bank_info = f" [Bank {pc['bank_msb']}:{pc['bank_lsb']}]"
-                    print(f"    Program {pc['program']:3d}: {pc['program_name']}{bank_info}")
+                    assumed = " (assumed)" if pc.get("assumed") else ""
+                    print(f"    Program {pc['program']:3d}: {pc['program_name']}{bank_info}{assumed}")
     else:
         print("  (No program changes found)")
 
