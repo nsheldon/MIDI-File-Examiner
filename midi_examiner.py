@@ -15,7 +15,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.0.0-beta.11"
+__version__ = "1.0.0-beta.12"
 
 # Import the database module for patch lookups
 import midi_patches_db
@@ -195,6 +195,124 @@ def format_position(absolute_ticks, ppqn, time_signatures):
         return f"measure {measure}, beat {beat}.{subdivision} (tick {absolute_ticks})"
     else:
         return f"measure {measure}, beat {beat} (tick {absolute_ticks})"
+
+
+def determine_minimum_xg_level(results):
+    """Determine the minimum XG level required to play an XG MIDI file.
+
+    Examines all program changes and their bank select values to determine
+    which XG level is required. Uses the XG voice database for known entries
+    and heuristics (bank LSB >= 64 implies Level 2+) for unlisted banks.
+
+    XG Levels:
+        1 = Basic XG (MU50, MU80, MU90)
+        2 = XG Level 2 / MU100 Native (MU100, MU100R, SW1000XG)
+        3 = XG Level 3 / MU128 (MU128 only)
+
+    Args:
+        results: The analysis results dict (must have detected_standard == "XG")
+
+    Returns:
+        Dict with keys: minimum_xg_level, minimum_xg_device, minimum_xg_reason
+    """
+    conn = midi_patches_db.get_connection()
+    cursor = conn.cursor()
+
+    XG_LEVEL_DEVICES = {
+        1: "XG Level 1 (MU50/MU80/MU90)",
+        2: "XG Level 2 (MU100)",
+        3: "XG Level 3 (MU128)",
+    }
+    max_level = 1
+    level_reasons = {2: set(), 3: set()}
+
+    for pc in results["program_changes"]:
+        msb = pc["bank_msb"]
+        lsb = pc["bank_lsb"]
+        program = pc["program"]
+        is_percussion = pc["is_percussion"]
+
+        if is_percussion:
+            # Look up drum kit level
+            cursor.execute("""
+                SELECT minimum_level, name FROM percussion_sets
+                WHERE standard = 'XG' AND bank_msb = ? AND bank_lsb = ? AND program = ?
+            """, (msb, lsb, program))
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                lvl, name = row
+                if lvl > max_level:
+                    max_level = lvl
+                if lvl >= 2:
+                    level_reasons[lvl].add(name or f"Drum Kit {program}")
+            elif msb in (126, 127):
+                # Unknown SFX/drum kit in XG banks — at least Level 1 XG
+                pass
+        else:
+            # Model Exclusive bank (MSB=48) — always Level 2+
+            if msb == 48:
+                if max_level < 2:
+                    max_level = 2
+                name = pc.get("program_name") or f"Model Exclusive pgm {program}"
+                level_reasons[2].add(name)
+                continue
+
+            # "Other Waves" and "Other Instrument" banks (LSB 64-127) — Level 2+
+            if msb == 0 and lsb >= 64:
+                if max_level < 2:
+                    max_level = 2
+                # Check database for specific Level 3 entries
+                cursor.execute("""
+                    SELECT minimum_level, name FROM patches
+                    WHERE standard = 'XG' AND bank_msb = ? AND bank_lsb = ? AND program = ?
+                """, (msb, lsb, program))
+                row = cursor.fetchone()
+                if row and row[0] is not None:
+                    lvl, name = row
+                    if lvl > max_level:
+                        max_level = lvl
+                    if lvl >= 2:
+                        level_reasons[lvl].add(name or f"LSB{lsb} pgm{program+1}")
+                else:
+                    # Unlisted voice in Other Waves bank — Level 2 by bank heuristic
+                    level_reasons[2].add(f"Bank LSB{lsb} pgm{program+1}")
+                continue
+
+            # Standard XG banks (MSB=0, LSB=0-63): look up in database
+            cursor.execute("""
+                SELECT minimum_level, name FROM patches
+                WHERE standard = 'XG' AND bank_msb = ? AND bank_lsb = ? AND program = ?
+            """, (msb, lsb, program))
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                lvl, name = row
+                if lvl > max_level:
+                    max_level = lvl
+                if lvl >= 2:
+                    level_reasons[lvl].add(name or f"LSB{lsb} pgm{program+1}")
+
+    conn.close()
+
+    # Build reason string
+    reason = ""
+    if max_level >= 2:
+        culprit_level = max_level
+        culprit_patches = level_reasons.get(culprit_level, set())
+        if not culprit_patches:
+            # May have Level 2 patches but no Level 3; show Level 2 reasons
+            culprit_patches = level_reasons.get(2, set())
+        if culprit_patches:
+            patch_list = ", ".join(sorted(culprit_patches)[:3])
+            if len(culprit_patches) > 3:
+                patch_list += f" (+{len(culprit_patches) - 3} more)"
+            level_name = "Level 2" if culprit_level == 2 else "Level 3"
+            reason = f"uses {level_name}-exclusive voice(s): {patch_list}"
+
+    return {
+        "minimum_xg_level": max_level,
+        "minimum_xg_device": XG_LEVEL_DEVICES.get(max_level, f"XG Level {max_level}"),
+        "minimum_xg_reason": reason,
+    }
 
 
 def determine_minimum_sc_version(results):
@@ -689,6 +807,10 @@ def analyze_midi_file(filepath):
     if detected_standard == "GS":
         results["gs_info"] = determine_minimum_sc_version(results)
 
+    # Determine minimum XG level for XG files
+    if detected_standard == "XG":
+        results["xg_info"] = determine_minimum_xg_level(results)
+
     return results
 
 
@@ -744,6 +866,22 @@ def print_results(results):
         else:
             suffix = " (detected via SysEx)"
         print(f"  MIDI Standard: {standard}{suffix}")
+        if standard == "GS" and "gs_info" in results:
+            gs = results["gs_info"]
+            sc_line = f"  Roland SC Req:  {gs['minimum_sc_version']}"
+            if gs.get("minimum_sc_reason"):
+                sc_line += f" ({gs['minimum_sc_reason']})"
+            print(sc_line)
+            if gs["uses_cm64_pcm"]:
+                print(f"  CM-64 PCM:      Yes (MSB 126)")
+            if gs["uses_cm64_la"]:
+                print(f"  CM-64 LA:       Yes (MSB 127)")
+        if standard == "XG" and "xg_info" in results:
+            xg = results["xg_info"]
+            xg_line = f"  Yamaha XG Req:  {xg['minimum_xg_device']}"
+            if xg.get("minimum_xg_reason"):
+                xg_line += f" ({xg['minimum_xg_reason']})"
+            print(xg_line)
     else:
         reason = results.get("standard_unknown_reason")
         if reason:
@@ -883,18 +1021,6 @@ def print_results(results):
         print(f"  Roland GS detected:   {'Yes' if gs_messages else 'No'}")
         print(f"  Yamaha XG detected:   {'Yes' if xg_messages else 'No'}")
 
-        # GS version requirements
-        if "gs_info" in results:
-            gs = results["gs_info"]
-            print_subsection("Roland GS Requirements")
-            sc_line = f"  Minimum SC version:   {gs['minimum_sc_version']}"
-            if gs.get("minimum_sc_reason"):
-                sc_line += f" ({gs['minimum_sc_reason']})"
-            print(sc_line)
-            if gs["uses_cm64_pcm"]:
-                print(f"  CM-64 PCM patches:    Yes (MSB 126)")
-            if gs["uses_cm64_la"]:
-                print(f"  CM-64 LA patches:     Yes (MSB 127)")
     else:
         print("  (No SysEx messages found)")
 

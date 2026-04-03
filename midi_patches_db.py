@@ -1800,6 +1800,249 @@ GS_DRUMKITS = [
     (127, '', '', '', 'CM-64/32L'),
 ]
 
+
+# XG Basic Normal Voices (Bank MSB=0, LSB=0, Level 1)
+# Format: (program, name, category)
+XG_BASIC_INSTRUMENTS = [
+    # Piano (0-7)
+    (0, "GrandPno", "Piano"),
+    (1, "BritePno", "Piano"),
+    (2, "El.Grand", "Piano"),
+    (3, "HnkyTonk", "Piano"),
+    (4, "E.Piano1", "Piano"),
+    (5, "E.Piano2", "Piano"),
+    (6, "Harpsi.", "Piano"),
+    (7, "Clavi", "Piano"),
+    # Chromatic Percussion (8-15)
+    (8, "Celesta", "Chromatic Percussion"),
+    (9, "Glocken", "Chromatic Percussion"),
+    (10, "MusicBox", "Chromatic Percussion"),
+    (11, "Vibes", "Chromatic Percussion"),
+    (12, "Marimba", "Chromatic Percussion"),
+    (13, "Xylophon", "Chromatic Percussion"),
+    (14, "TubulBel", "Chromatic Percussion"),
+    (15, "Dulcimer", "Chromatic Percussion"),
+    # Organ (16-23)
+    (16, "DrawOrgn", "Organ"),
+    (17, "PercOrgn", "Organ"),
+    (18, "RockOrgn", "Organ"),
+    (19, "ChrchOrg", "Organ"),
+    (20, "ReedOrgn", "Organ"),
+    (21, "Acordion", "Organ"),
+    (22, "Harmnica", "Organ"),
+    (23, "TangoAcd", "Organ"),
+    # Guitar (24-31)
+    (24, "NylonGtr", "Guitar"),
+    (25, "SteelGtr", "Guitar"),
+    (26, "Jazz Gtr", "Guitar"),
+    (27, "CleanGtr", "Guitar"),
+    (28, "Mute Gtr", "Guitar"),
+    (29, "Ovrdrive", "Guitar"),
+    (30, "Dist.Gtr", "Guitar"),
+    (31, "GtrHarmo", "Guitar"),
+    # Bass (32-39)
+    (32, "Aco.Bass", "Bass"),
+    (33, "FngrBass", "Bass"),
+    (34, "PickBass", "Bass"),
+    (35, "Fretless", "Bass"),
+    (36, "SlapBas1", "Bass"),
+    (37, "SlapBas2", "Bass"),
+    (38, "SynBass1", "Bass"),
+    (39, "SynBass2", "Bass"),
+    # Strings (40-47)
+    (40, "Violin", "Strings"),
+    (41, "Viola", "Strings"),
+    (42, "Cello", "Strings"),
+    (43, "Contrabs", "Strings"),
+    (44, "Trem.Str", "Strings"),
+    (45, "Pizz.Str", "Strings"),
+    (46, "Harp", "Strings"),
+    (47, "Timpani", "Strings"),
+    # Ensemble (48-55)
+    (48, "Strings1", "Ensemble"),
+    (49, "Strings2", "Ensemble"),
+    (50, "Syn Str1", "Ensemble"),
+    (51, "Syn Str2", "Ensemble"),
+    (52, "ChoirAah", "Ensemble"),
+    (53, "VoiceOoh", "Ensemble"),
+    (54, "SynVoice", "Ensemble"),
+    (55, "Orch.Hit", "Ensemble"),
+    # Brass (56-63)
+    (56, "Trumpet", "Brass"),
+    (57, "Trombone", "Brass"),
+    (58, "Tuba", "Brass"),
+    (59, "Mute Trp", "Brass"),
+    (60, "Fr. Horn", "Brass"),
+    (61, "BrssSect", "Brass"),
+    (62, "SynBrss1", "Brass"),
+    (63, "SynBrss2", "Brass"),
+    # Reed (64-71)
+    (64, "SprnoSax", "Reed"),
+    (65, "Alto Sax", "Reed"),
+    (66, "TenorSax", "Reed"),
+    (67, "Bari.Sax", "Reed"),
+    (68, "Oboe", "Reed"),
+    (69, "Eng.Horn", "Reed"),
+    (70, "Bassoon", "Reed"),
+    (71, "Clarinet", "Reed"),
+    # Pipe (72-79)
+    (72, "Piccolo", "Pipe"),
+    (73, "Flute", "Pipe"),
+    (74, "Recorder", "Pipe"),
+    (75, "PanFlute", "Pipe"),
+    (76, "Bottle", "Pipe"),
+    (77, "Shakhchi", "Pipe"),
+    (78, "Whistle", "Pipe"),
+    (79, "Ocarina", "Pipe"),
+    # Synth Lead (80-87)
+    (80, "SquareLd", "Synth Lead"),
+    (81, "Saw Ld", "Synth Lead"),
+    (82, "CaliopLd", "Synth Lead"),
+    (83, "Chiff Ld", "Synth Lead"),
+    (84, "CharanLd", "Synth Lead"),
+    (85, "Voice Ld", "Synth Lead"),
+    (86, "Fifth Ld", "Synth Lead"),
+    (87, "Bass&Ld", "Synth Lead"),
+    # Synth Pad (88-95)
+    (88, "NewAgePd", "Synth Pad"),
+    (89, "Warm Pad", "Synth Pad"),
+    (90, "PolySyPd", "Synth Pad"),
+    (91, "ChoirPad", "Synth Pad"),
+    (92, "BowedPad", "Synth Pad"),
+    (93, "MetalPad", "Synth Pad"),
+    (94, "Halo Pad", "Synth Pad"),
+    (95, "SweepPad", "Synth Pad"),
+    # Synth Effects (96-103)
+    (96, "Rain", "Synth Effects"),
+    (97, "SoundTrk", "Synth Effects"),
+    (98, "Crystal", "Synth Effects"),
+    (99, "Atmosphr", "Synth Effects"),
+    (100, "Bright", "Synth Effects"),
+    (101, "Goblins", "Synth Effects"),
+    (102, "Echoes", "Synth Effects"),
+    (103, "Sci-Fi", "Synth Effects"),
+    # Ethnic (104-111)
+    (104, "Sitar", "Ethnic"),
+    (105, "Banjo", "Ethnic"),
+    (106, "Shamisen", "Ethnic"),
+    (107, "Koto", "Ethnic"),
+    (108, "Kalimba", "Ethnic"),
+    (109, "Bagpipe", "Ethnic"),
+    (110, "Fiddle", "Ethnic"),
+    (111, "Shanai", "Ethnic"),
+    # Percussive (112-119)
+    (112, "TnklBell", "Percussive"),
+    (113, "Agogo", "Percussive"),
+    (114, "SteelDrm", "Percussive"),
+    (115, "Woodblok", "Percussive"),
+    (116, "TaikoDrm", "Percussive"),
+    (117, "MelodTom", "Percussive"),
+    (118, "Syn Drum", "Percussive"),
+    (119, "RevCymbl", "Percussive"),
+    # Sound Effects (120-127)
+    (120, "FretNoiz", "Sound Effects"),
+    (121, "BrthNoiz", "Sound Effects"),
+    (122, "Seashore", "Sound Effects"),
+    (123, "Tweet", "Sound Effects"),
+    (124, "Telphone", "Sound Effects"),
+    (125, "Helicptr", "Sound Effects"),
+    (126, "Applause", "Sound Effects"),
+    (127, "Gunshot", "Sound Effects"),
+]
+
+# XG Extension Voices (non-basic banks)
+# Format: (bank_msb, bank_lsb, program, name, category, minimum_level)
+# minimum_level: 1=XG Level 1, 2=XG Level 2 (MU100+), 3=XG Level 3 (MU128 only)
+# Source: MU100/MU128 manuals. † markers = Level 2, †† markers = Level 3.
+# LSBs 64-127 ("Other Waves" and "Other Instrument" banks) are all Level 2+.
+XG_EXTENSION_INSTRUMENTS = [
+    # --- Violin variants (pgm=40) ---
+    # LSBs 64-65: Level 2 (†)
+    (0, 64, 40, "Cadenza", "Strings", 2),
+    (0, 65, 40, "CadenzDk", "Strings", 2),
+    # LSBs 66-68: Level 3 (††)
+    (0, 66, 40, "Vln Sec", "Strings", 3),
+    (0, 67, 40, "Hrd Vlns", "Strings", 3),
+    (0, 68, 40, "Slw Vlns", "Strings", 3),
+    # --- Viola variants (pgm=41) ---
+    (0, 64, 41, "Sonata", "Strings", 2),
+    (0, 65, 41, "Vla Sec", "Strings", 3),
+    (0, 66, 41, "Hrd Vlas", "Strings", 3),
+    (0, 67, 41, "Slw Vlas", "Strings", 3),
+    # --- Cello variants (pgm=42) ---
+    (0, 65, 42, "CelloSec", "Strings", 3),
+    (0, 66, 42, "Hrd Vcs", "Strings", 3),
+    (0, 67, 42, "Slw Vcs", "Strings", 3),
+    # --- Contrabass variants (pgm=43) ---
+    (0, 65, 43, "CB Sec", "Strings", 3),
+    (0, 66, 43, "Hrd CBs", "Strings", 3),
+    (0, 67, 43, "Slw CBs", "Strings", 3),
+    # --- Pizzicato Strings variants (pgm=45) ---
+    (0, 65, 45, "Collegno", "Strings", 3),
+    # --- String Ensemble 1 variants (pgm=48) ---
+    (0, 68, 48, "Stacc H", "Ensemble", 3),
+    (0, 69, 48, "Stacc L", "Ensemble", 3),
+    # --- Chinese wind instruments at LSB=96 (Other Instrument 1) ---
+    # Piccolo slot (pgm=72): Bang Di (Chinese bamboo flute)
+    (0, 96, 72, "Bang Di", "Pipe", 3),
+    # Flute slot (pgm=73): Qu Di (Chinese transverse flute)
+    (0, 96, 73, "Qu Di", "Pipe", 3),
+    # Bagpipe slot (pgm=109): Sheng (Chinese mouth organ)
+    (0, 96, 109, "Sheng", "Pipe", 3),
+    # Fiddle slot (pgm=110): Er Hu (Chinese spike fiddle)
+    (0, 96, 110, "Er Hu", "Strings", 3),
+]
+
+# XG Drum Kits
+# Format: (bank_msb, bank_lsb, program, name, minimum_level)
+# bank_msb=127: standard XG percussion channel designation
+# bank_msb=126: XG SFX percussion channel designation
+# program is 0-indexed MIDI program number (XG manual uses 1-indexed)
+# Level markers: *** = MU90 (Level 1), **** = MU100 (Level 2), †† = MU128 (Level 3)
+XG_DRUMKITS = [
+    # MSB=127, LSB=0: Standard drum kits
+    (127, 0, 0, "Standard Kit", 1),
+    (127, 0, 1, "Standard Kit 2", 1),       # MU90 extension
+    (127, 0, 2, "Dry Kit", 1),              # MU90
+    (127, 0, 3, "Bright Kit", 1),           # MU90
+    (127, 0, 4, "Skim Kit", 2),             # MU100 Level 2
+    (127, 0, 5, "Slim Kit", 2),             # MU100 Level 2
+    (127, 0, 6, "Rogue Kit", 2),            # MU100 Level 2
+    (127, 0, 7, "Hob Kit", 2),              # MU100 Level 2
+    (127, 0, 8, "Room Kit", 1),
+    (127, 0, 9, "Dark Room Kit", 1),        # MU90
+    (127, 0, 16, "Rock Kit", 1),
+    (127, 0, 17, "Rock Kit 2", 1),          # MU90
+    (127, 0, 24, "Electro Kit", 1),
+    (127, 0, 25, "Analog Kit", 1),
+    (127, 0, 26, "Analog Kit 2", 1),        # MU90
+    (127, 0, 27, "Dance Kit", 1),           # MU90
+    (127, 0, 28, "Hip Hop Kit", 1),         # MU90
+    (127, 0, 29, "Jungle Kit", 1),          # MU90
+    (127, 0, 30, "Apogee Kit", 2),          # MU100 Level 2
+    (127, 0, 31, "Perigee Kit", 2),         # MU100 Level 2
+    (127, 0, 32, "Jazz Kit", 1),
+    (127, 0, 33, "Jazz Kit 2", 1),          # MU90
+    (127, 0, 40, "Brush Kit", 1),
+    (127, 0, 41, "Brush Kit 2", 2),         # MU100 Level 2
+    (127, 0, 48, "Symphony Kit", 1),
+    (127, 0, 64, "Tramp Kit", 2),           # MU100 Level 2
+    (127, 0, 65, "Amber Kit", 2),           # MU100 Level 2
+    (127, 0, 66, "Coffin Kit", 2),          # MU100 Level 2
+    (127, 0, 126, "Standard Kit (MU100 Native)", 2),  # MU100 Level 2
+    (127, 0, 127, "Standard Kit (MU Basic)", 1),
+    # MSB=126, LSB=0: SFX kits
+    (126, 0, 0, "SFX Kit 1", 1),
+    (126, 0, 1, "SFX Kit 2", 1),
+    (126, 0, 16, "Techno Kit K/S", 2),      # MU100 Level 2
+    (126, 0, 17, "Techno Kit Hi", 2),       # MU100 Level 2
+    (126, 0, 18, "Techno Kit Lo", 2),       # MU100 Level 2
+    (126, 0, 32, "Sakura Kit", 2),          # MU100 Level 2
+    (126, 0, 33, "Small Latin Kit", 2),     # MU100 Level 2
+    (126, 0, 34, "China Kit", 3),           # MU128 Level 3
+]
+
+
 def get_connection():
     """Get a database connection."""
     return sqlite3.connect(DB_PATH)
@@ -1837,6 +2080,13 @@ def init_database():
         )
     """)
 
+    # Add minimum_level column if it doesn't exist (migration for older databases)
+    for table in ("patches", "percussion_sets"):
+        try:
+            cursor.execute(f"ALTER TABLE {table} ADD COLUMN minimum_level INTEGER NOT NULL DEFAULT 1")
+        except Exception:
+            pass  # Column already exists
+
     # Create indexes for faster lookups
     cursor.execute("""
         CREATE INDEX IF NOT EXISTS idx_patches_lookup
@@ -1857,6 +2107,15 @@ def init_database():
         _populate_drum_kits(conn)
         _populate_gs_patches(conn)
         _populate_gs_drumkits(conn)
+        _populate_xg_patches(conn)
+        _populate_xg_drumkits(conn)
+    else:
+        # Check if XG data exists; add it if not (migration for databases
+        # created before XG support was added)
+        cursor.execute("SELECT COUNT(*) FROM patches WHERE standard = 'XG'")
+        if cursor.fetchone()[0] == 0:
+            _populate_xg_patches(conn)
+            _populate_xg_drumkits(conn)
 
     conn.close()
 
@@ -1957,6 +2216,51 @@ def _populate_gs_drumkits(conn):
                     (standard, bank_msb, bank_lsb, program, name)
                     VALUES (?, ?, ?, ?, ?)
                 """, ("GS", 0, cc32, pc, name))
+
+    conn.commit()
+
+
+def _populate_xg_patches(conn):
+    """Populate XG patches.
+
+    Adds Level 1 basic voices (Bank MSB=0, LSB=0) and Level 2/3 extension
+    voices. minimum_level: 1=XG Level 1, 2=MU100+, 3=MU128 only.
+    """
+    cursor = conn.cursor()
+
+    # Basic XG voices at (MSB=0, LSB=0) — all Level 1
+    for program, name, category in XG_BASIC_INSTRUMENTS:
+        cursor.execute("""
+            INSERT OR IGNORE INTO patches
+            (standard, bank_msb, bank_lsb, program, name, category, minimum_level)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, ("XG", 0, 0, program, name, category, 1))
+
+    # Extension bank voices (Level 2 and Level 3)
+    for bank_msb, bank_lsb, program, name, category, minimum_level in XG_EXTENSION_INSTRUMENTS:
+        cursor.execute("""
+            INSERT OR IGNORE INTO patches
+            (standard, bank_msb, bank_lsb, program, name, category, minimum_level)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, ("XG", bank_msb, bank_lsb, program, name, category, minimum_level))
+
+    conn.commit()
+
+
+def _populate_xg_drumkits(conn):
+    """Populate XG drum kits.
+
+    Adds standard XG percussion kits (MSB=127) and SFX kits (MSB=126).
+    minimum_level: 1=XG Level 1, 2=MU100+, 3=MU128 only.
+    """
+    cursor = conn.cursor()
+
+    for bank_msb, bank_lsb, program, name, minimum_level in XG_DRUMKITS:
+        cursor.execute("""
+            INSERT OR IGNORE INTO percussion_sets
+            (standard, bank_msb, bank_lsb, program, name, minimum_level)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, ("XG", bank_msb, bank_lsb, program, name, minimum_level))
 
     conn.commit()
 
