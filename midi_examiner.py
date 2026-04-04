@@ -15,7 +15,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.0.0-beta.13"
+__version__ = "1.0.0"
 
 # Import the database module for patch lookups
 import midi_patches_db
@@ -422,18 +422,63 @@ def decode_midi_text(text):
     return text  # fall back to Latin-1 (original mido behaviour)
 
 
+def _load_midi(filepath):
+    """Load a MIDI file, retrying with workarounds for known mido parse errors.
+
+    Returns (mid, clipped, smpte_fallback) where clipped indicates note values
+    were clamped and smpte_fallback indicates an invalid SMPTE frame-rate code
+    was ignored during parsing.
+    Raises IOError with a descriptive message if the file cannot be read.
+    """
+    import mido.midifiles.meta as _meta
+
+    def _try_load(clip):
+        return mido.MidiFile(filepath, clip=clip)
+
+    def _try_load_smpte_tolerant(clip):
+        # Some files contain SMPTE Offset meta events (0xFF 0x54) with
+        # out-of-spec frame-rate codes that mido rejects with KeyError.
+        # Patch the decode method to fall back to 24 fps for unknown codes.
+        orig_decode = _meta.MetaSpec_smpte_offset.decode
+
+        def _lenient_decode(self, message, data):
+            fr_code = data[0] >> 5
+            message.frame_rate = _meta._smpte_framerate_decode.get(fr_code, 24)
+            message.hours = data[0] & 0b00011111
+            message.minutes = data[1]
+            message.seconds = data[2]
+            message.frames = data[3]
+            message.sub_frames = data[4]
+
+        _meta.MetaSpec_smpte_offset.decode = _lenient_decode
+        try:
+            return mido.MidiFile(filepath, clip=clip)
+        finally:
+            _meta.MetaSpec_smpte_offset.decode = orig_decode
+
+    for clip in (False, True):
+        try:
+            return _try_load(clip), clip, False
+        except KeyError:
+            # Likely an unrecognised SMPTE frame-rate code — retry with patch.
+            try:
+                return _try_load_smpte_tolerant(clip), clip, True
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+    # All attempts failed — run once more to capture a clean error message.
+    try:
+        _try_load(clip=True)
+    except Exception as e:
+        raise IOError(f"Cannot open MIDI file: {e}") from e
+    raise IOError("Cannot open MIDI file: unknown error")
+
+
 def analyze_midi_file(filepath):
     """Analyze a MIDI file and return structured data."""
-    clipped = False
-    try:
-        mid = mido.MidiFile(filepath)
-    except Exception:
-        try:
-            mid = mido.MidiFile(filepath, clip=True)
-            clipped = True
-        except Exception as e:
-            print(f"Error opening MIDI file: {e}")
-            sys.exit(1)
+    mid, clipped, smpte_fallback = _load_midi(filepath)
 
     results = {
         "file_info": {},
@@ -452,6 +497,11 @@ def analyze_midi_file(filepath):
     if clipped:
         results["warnings"].append(
             "File contains out-of-range data bytes (clipped to valid range during parsing)."
+        )
+    if smpte_fallback:
+        results["warnings"].append(
+            "File contains an unrecognised SMPTE frame-rate code in a SMPTE Offset meta event "
+            "(0xFF 0x54); the frame rate was ignored and defaulted to 24 fps."
         )
 
     # File info
@@ -672,14 +722,22 @@ def analyze_midi_file(filepath):
     standard_upgraded_from = None   # set when GM→GM2 upgrade happens
     standard_upgrade_reason = None
     if detected_standard is None:
+        has_bank_selects = bool(results["bank_selects"])
+        has_program_changes = bool(results["program_changes"])
         all_gm_banks = all(
             bs["value"] == 0
             for bs in results["bank_selects"]
         )
-        if all_gm_banks:  # True even when bank_selects is empty
+        if not has_bank_selects and not has_program_changes:
+            # No MIDI standard evidence at all — leave as unknown
+            standard_unknown_reason = "no SysEx, bank select, or program change messages detected"
+        elif all_gm_banks:
             detected_standard = "GM"
             standard_assumed = True
-            standard_assumed_reason = "no reset SysEx found; all bank selects use GM values"
+            if has_bank_selects:
+                standard_assumed_reason = "no reset SysEx found; all bank selects use GM values"
+            else:
+                standard_assumed_reason = "no reset SysEx found; no bank selects detected"
         else:
             # Build a human-readable reason. Non-zero MSBs are the primary
             # indicator; only fall back to LSBs if all MSBs are zero.
@@ -821,12 +879,17 @@ def analyze_midi_file(filepath):
     # Names were looked up during the track loop when detected_standard may
     # have been None or GM; refresh them so every entry reflects the correct
     # standard (e.g. GM2 percussion kit names after a GM→GM2 upgrade).
+    # When the standard is unknown, leave program_name as None so the display
+    # omits patch database names.
     for pc in results["program_changes"]:
-        pc["program_name"] = get_instrument_name(
-            pc["program"], pc["channel"],
-            pc["bank_msb"], pc["bank_lsb"],
-            detected_standard
-        )
+        if detected_standard is None:
+            pc["program_name"] = None
+        else:
+            pc["program_name"] = get_instrument_name(
+                pc["program"], pc["channel"],
+                pc["bank_msb"], pc["bank_lsb"],
+                detected_standard
+            )
 
     # For GM/GM2: if a channel has note-ons but no program change, it uses the
     # default program 0 on bank 0:0.  Add a synthetic entry so the channel
@@ -945,6 +1008,55 @@ def _print_karaoke_lines(lines):
         if is_para and i > 0:
             print()
         print(f"  {line}")
+
+
+def _join_syllables(syllables):
+    """Join syllables into a word/phrase, respecting continuation markers.
+
+    A hyphen or underscore at the end of a syllable means the next syllable
+    continues the same word (no space inserted).  If the syllable already
+    carries its own leading/trailing space, that space is preserved.
+    """
+    if not syllables:
+        return ""
+    result = syllables[0]
+    for syl in syllables[1:]:
+        if result.endswith("-") or result.endswith("_"):
+            result += syl
+        elif result.endswith(" ") or syl.startswith(" "):
+            result += syl
+        else:
+            result += " " + syl
+    return result
+
+
+def _assemble_lyrics_by_measure(lyrics, ppqn, time_sigs_abs):
+    """Group lyric syllables by measure, returning one string per measure line.
+
+    Syllables within the same measure are joined using _join_syllables so that
+    word-continuation hyphens are respected and spaces are added between words.
+    Returns a list of non-empty strings.
+    """
+    lines = []
+    current_measure = None
+    current_syllables = []
+    for lyric in lyrics:
+        measure, _, _ = ticks_to_measure_beat(lyric["abs_time"], ppqn, time_sigs_abs)
+        text = sanitize_text(lyric["text"])
+        if measure != current_measure:
+            if current_syllables:
+                joined = _join_syllables(current_syllables).strip()
+                if joined:
+                    lines.append(joined)
+            current_measure = measure
+            current_syllables = [text]
+        else:
+            current_syllables.append(text)
+    if current_syllables:
+        joined = _join_syllables(current_syllables).strip()
+        if joined:
+            lines.append(joined)
+    return lines
 
 
 def print_results(results):
@@ -1109,8 +1221,11 @@ def print_results(results):
         if lines:
             _print_karaoke_lines(lines)
         else:
-            for lyric in results["metadata"]["lyrics"]:
-                print(f"  {sanitize_text(lyric['text'])}")
+            measure_lines = _assemble_lyrics_by_measure(
+                results["metadata"]["lyrics"], ppqn, time_sigs_abs
+            )
+            for line in measure_lines:
+                print(f"  {line}")
 
     # Lyrics assembled from text events (Soft Karaoke files that store lyrics
     # only as text events rather than MIDI lyrics events)
@@ -1204,7 +1319,9 @@ def print_results(results):
                     if pc["bank_msb"] != 0 or pc["bank_lsb"] != 0:
                         bank_info = f" [Bank {pc['bank_msb']}:{pc['bank_lsb']}]"
                     assumed = " (assumed)" if pc.get("assumed") else ""
-                    print(f"    Program {pc['program']:3d}: {pc['program_name']}{bank_info}{assumed}")
+                    name = pc.get("program_name")
+                    name_str = f": {name}" if name is not None else ""
+                    print(f"    Program {pc['program']:3d}{name_str}{bank_info}{assumed}")
     else:
         print("  (No program changes found)")
 
@@ -1235,7 +1352,11 @@ Examples:
     args = parser.parse_args()
 
     # Analyze the file
-    results = analyze_midi_file(args.midi_file)
+    try:
+        results = analyze_midi_file(args.midi_file)
+    except IOError as e:
+        print(e)
+        sys.exit(1)
 
     # Output results
     if args.json:

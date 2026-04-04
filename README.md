@@ -5,12 +5,12 @@ A tool for analyzing MIDI files, available as a macOS GUI app and a command-line
 ## Features
 
 - **macOS GUI app** with tabbed sections for each analysis category, drag-and-drop file loading, and automatic Light/Dark mode support
-- Detects the MIDI standard in use (GM, GM2, GS, XG) via SysEx messages, or assumes GM when files use only base GM banks
+- Detects the MIDI standard in use (GM, GM2, GS, XG) via SysEx messages, assumes GM when files use only base GM banks or program changes, or reports Unknown when no standard evidence is present
 - Resolves program change numbers to instrument and drum kit names using an embedded patch database
 - For Roland GS files, identifies the minimum Sound Canvas version required (SC-55, SC-88, SC-88Pro, or SC-8850) and flags CM-64 PCM/LA patch usage
 - For Yamaha XG files, identifies the minimum XG level required (Level 1 / MU50/MU80/MU90, Level 2 / MU100, or Level 3 / MU128)
 - Detects **Soft Karaoke (KAR) format** files and displays title, language, version, and info metadata in the File Info section
-- Assembles karaoke lyrics into readable lines using KMIDI `\` / `/` line-break conventions, whether lyrics are stored as MIDI lyrics events or text events
+- Assembles karaoke lyrics into readable lines using KMIDI `\` / `/` line-break conventions, whether lyrics are stored as MIDI lyrics events or text events; groups non-karaoke lyrics by measure for readability
 - For GM/GM2 files, shows channels with note activity but no program change as using Program 0 (marked "assumed")
 - Reports tempo and time signature changes with measure/beat positions
 - Lists SysEx, bank select, program change, text, marker, cue point, and lyric events
@@ -101,6 +101,13 @@ python midi_examiner.py --json <midi_file> > analysis.json
 ```
 
 ## Changelog
+
+### 1.0.0
+- **Unknown MIDI standard detection:** Files with no SysEx reset, no bank select messages, and no program change messages are now reported as `Unknown` rather than being incorrectly assumed to be GM
+- **Program name suppression for unknown standard:** When the MIDI standard cannot be determined, the Program Changes section lists program numbers without resolving them against the patch database
+- **Measure-grouped lyrics display:** Non-karaoke MIDI files with lyrics events (but no KMIDI line-break markers) now display lyrics grouped by measure — syllables within the same measure are joined into a single line with hyphens respected as word-continuation markers
+- **Tolerant SMPTE Offset parsing:** Files containing a SMPTE Offset meta event (0xFF 0x54) with an out-of-spec frame-rate code (e.g. code 6) are now parsed successfully; a warning is displayed noting that the frame rate was unrecognised and defaulted to 24 fps
+- **Improved error handling:** File open errors are now reported with descriptive messages; the GUI displays errors in an Error tab rather than terminating the process
 
 ### 1.0.0-beta.13
 - **Soft Karaoke (KAR) detection:** Identifies files using the Soft Karaoke format via the `@KMIDI KARAOKE FILE` text event marker; displays format name, version (`@KV`), title (`@T`), language (`@L`), and info (`@I`) lines in the File Info section
