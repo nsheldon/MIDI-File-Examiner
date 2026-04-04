@@ -85,19 +85,92 @@ python midi_examiner.py --json <midi_file> > analysis.json
 ============================================================
   Filename:      song.mid
   Format:        Multi Track (Type 1)
-  Tracks:        5
-  Length:        3:42.00
+  Tracks:        20
+  Length:        4:02.44
   MIDI Standard: GS (detected via SysEx)
+  Roland SC Req:  SC-8850 (uses SC-8850-exclusive patch(es): Ambient BPF, Dist Rtm GTR, Double Pick (+1 more))
+
+============================================================
+ TIMING INFORMATION
+============================================================
+  Timing Type:   PPQ (Pulses Per Quarter Note)
+  PPQN:          48 ticks per quarter note
+
+--- Tempo Changes ---
+  Initial:       126.0 BPM (476190 µs/beat)
+
+--- Time Signature(s) ---
+  Initial:       4/4
+                 (24 MIDI clocks/click, 8 32nd notes/beat)
+
+============================================================
+ METADATA
+============================================================
+  Song Title:    Song Title Here
+  Copyright:     Original Composer (Arranger)
+  Key Signature: Em
+
+============================================================
+ TRACK INFORMATION
+============================================================
+  Track  0: Song Title Here (72 events)
+  Track  1: Lead Guitar (2409 events)
+  Track  2: Rhythm Guitar (1575 events)
+  ...
+
+============================================================
+ TEXT EVENTS
+============================================================
+  Track 0: "Arranged for Roland SC-8850" at measure 1, beat 1 (tick 0)
+  Track 0: "Start of Setup" at measure 1, beat 1.24 (tick 24)
+  Track 0: "End of Setup" at measure 2, beat 1.22 (tick 214)
+
+============================================================
+ SYSTEM EXCLUSIVE (SYSEX) MESSAGES
+============================================================
+
+--- Roland GS ---
+  GS SysEx
+    Data: F0 41 10 42 12 00 00 7F 00 01 F7
+  GS SysEx
+    Data: F0 41 10 42 12 40 01 30 03 0C F7
+  ...
+
+--- SysEx Summary ---
+  Total SysEx messages: 52
+  GM/GM2 detected:      No
+  Roland GS detected:   Yes
+  Yamaha XG detected:   No
+
+============================================================
+ BANK SELECT MESSAGES
+============================================================
+  Channel  1: MSB values: {1}, LSB values: {4}
+  Channel  2: MSB values: {26}, LSB values: {4}
+  Channel  3: MSB values: {16}, LSB values: {0}
+  ...
 
 ============================================================
  PROGRAM CHANGES
 ============================================================
 
-  Channel  1:
-    Program  25: Steel-str.Gt [Bank 0:0]
+  Channel 1:
+    Program  30: Dist. Gt2 [Bank 1:4]
+
+  Channel 2:
+    Program  30: Dist Rtm GTR [Bank 26:4]
+
+  Channel 3:
+    Program  30: PowerGuitar [Bank 16:0]
 
   Channel 10 (Percussion):
-    Program   0: STANDARD
+    Program   0: STANDARD 1 [Bank 0:4]
+
+  ...
+
+============================================================
+ END OF ANALYSIS
+============================================================
 ```
 
 ## Changelog
