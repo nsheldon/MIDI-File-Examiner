@@ -175,6 +175,10 @@ python midi_examiner.py --json <midi_file> > analysis.json
 
 ## Changelog
 
+### 1.0.1
+- **Multi-file support (CLI):** `midi_examiner.py` now accepts multiple file paths; each file is analyzed in sequence with a blank line separator between outputs. Exits with code 1 if any file failed, but continues analyzing remaining files.
+- **Multi-file support (GUI):** Opening multiple files (via the file dialog, drag and drop, or command-line arguments) now adds each file to a sidebar list. Clicking a filename in the sidebar switches to that file's analysis. Files are analyzed in a queue — the next starts as soon as the previous finishes.
+
 ### 1.0.0
 - **Unknown MIDI standard detection:** Files with no SysEx reset, no bank select messages, and no program change messages are now reported as `Unknown` rather than being incorrectly assumed to be GM
 - **Program name suppression for unknown standard:** When the MIDI standard cannot be determined, the Program Changes section lists program numbers without resolving them against the patch database

@@ -15,6 +15,7 @@ try:
         QApplication, QMainWindow, QWidget,
         QVBoxLayout, QHBoxLayout,
         QPushButton, QLineEdit, QTextEdit, QFileDialog, QTabWidget, QMenu,
+        QListWidget, QListWidgetItem, QSplitter,
     )
     from PyQt6.QtGui import (QFont, QKeySequence, QAction,
                               QDragEnterEvent, QDropEvent,
@@ -685,6 +686,10 @@ class MidiExaminerWindow(QMainWindow):
         self.setWindowTitle(f"MIDI File Examiner {__version__}")
         self.setMinimumSize(900, 680)
         self.worker = None
+        self._file_sections = {}   # path -> [(label, content), ...]
+        self._file_order = []      # paths in insertion order
+        self._pending_paths = []   # analysis queue
+        self._active_worker_path = None
 
         self._build_menu()
         self._build_ui()
@@ -740,10 +745,23 @@ class MidiExaminerWindow(QMainWindow):
         file_bar.addWidget(self.open_button)
         layout.addLayout(file_bar)
 
-        # Tabbed results area — one tab per analysis section
+        # Horizontal splitter: sidebar (file list) on the left, tabs on the right
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        self.sidebar = QListWidget()
+        self.sidebar.setMinimumWidth(80)
+        self.sidebar.setMaximumWidth(320)
+        self.sidebar.currentItemChanged.connect(self._on_sidebar_selection_changed)
+        splitter.addWidget(self.sidebar)
+
         self.tab_widget = QTabWidget()
         self.tab_widget.setUsesScrollButtons(True)
-        layout.addWidget(self.tab_widget)
+        splitter.addWidget(self.tab_widget)
+
+        splitter.setSizes([180, 720])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
+        layout.addWidget(splitter)
 
         self.statusBar().showMessage("Ready — open a MIDI file to begin.")
 
@@ -752,47 +770,90 @@ class MidiExaminerWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def open_file_dialog(self):
-        path, _ = QFileDialog.getOpenFileName(
+        paths, _ = QFileDialog.getOpenFileNames(
             self,
-            "Open MIDI File",
+            "Open MIDI File(s)",
             "",
             "MIDI Files (*.mid *.midi);;All Files (*)",
         )
-        if path:
+        for path in paths:
             self.analyze(path)
 
     def analyze(self, path):
-        if self.worker and self.worker.isRunning():
+        # Already in the sidebar (analyzed or queued) — just select it.
+        if path in self._file_sections or path in self._pending_paths \
+                or path == self._active_worker_path:
+            self._select_sidebar_item(path)
             return
 
-        self.file_path_edit.setText(path)
-        self.tab_widget.clear()
-        self.open_button.setEnabled(False)
-        self.statusBar().showMessage("Analyzing…")
+        self._file_order.append(path)
+        item = QListWidgetItem(os.path.basename(path))
+        item.setData(Qt.ItemDataRole.UserRole, path)
+        self.sidebar.addItem(item)
+        self.sidebar.setCurrentItem(item)
 
+        self._pending_paths.append(path)
+        self._start_next_worker()
+
+    def _start_next_worker(self):
+        if self._active_worker_path is not None or not self._pending_paths:
+            return
+        path = self._pending_paths.pop(0)
+        self._active_worker_path = path
+        self.statusBar().showMessage(f"Analyzing: {os.path.basename(path)}")
         self.worker = AnalysisWorker(path)
         self.worker.finished.connect(self._on_analysis_done)
         self.worker.error.connect(self._on_analysis_error)
         self.worker.start()
 
     def _on_analysis_done(self, text):
-        for label, content in _split_sections(text):
+        path = self._active_worker_path
+        self._file_sections[path] = _split_sections(text)
+        self._active_worker_path = None
+        # Populate tabs if this file is currently selected in the sidebar
+        current = self.sidebar.currentItem()
+        if current and current.data(Qt.ItemDataRole.UserRole) == path:
+            self._populate_tabs(path)
+        self.statusBar().showMessage(f"Analysis complete: {os.path.basename(path)}")
+        self._start_next_worker()
+
+    def _on_analysis_error(self, message):
+        path = self._active_worker_path
+        self._file_sections[path] = [("Error", f"Error: {message}")]
+        self._active_worker_path = None
+        current = self.sidebar.currentItem()
+        if current and current.data(Qt.ItemDataRole.UserRole) == path:
+            self._populate_tabs(path)
+        self.statusBar().showMessage(f"Error: {os.path.basename(path)}")
+        self._start_next_worker()
+
+    def _populate_tabs(self, path):
+        self.tab_widget.clear()
+        for label, content in self._file_sections.get(path, []):
             view = self._make_text_view()
             view.setPlainText(content)
             view.moveCursor(view.textCursor().MoveOperation.Start)
             idx = self.tab_widget.addTab(view, label)
-            # Gray out tabs whose only content is a "nothing found" placeholder
             if re.match(r'^\s*\(No .+ found\)\s*$', content):
                 self.tab_widget.setTabEnabled(idx, False)
-        self.open_button.setEnabled(True)
-        self.statusBar().showMessage("Analysis complete.")
 
-    def _on_analysis_error(self, message):
-        view = self._make_text_view()
-        view.setPlainText(f"Error: {message}")
-        self.tab_widget.addTab(view, "Error")
-        self.open_button.setEnabled(True)
-        self.statusBar().showMessage("Error during analysis.")
+    def _select_sidebar_item(self, path):
+        for i in range(self.sidebar.count()):
+            item = self.sidebar.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == path:
+                self.sidebar.setCurrentItem(item)
+                return
+
+    def _on_sidebar_selection_changed(self, current, previous):
+        if current is None:
+            return
+        path = current.data(Qt.ItemDataRole.UserRole)
+        self.file_path_edit.setText(path)
+        if path in self._file_sections:
+            self._populate_tabs(path)
+        else:
+            # Still analyzing — clear tabs and wait for _on_analysis_done
+            self.tab_widget.clear()
 
     # ------------------------------------------------------------------
     # Drag and drop
@@ -800,13 +861,15 @@ class MidiExaminerWindow(QMainWindow):
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
-            urls = event.mimeData().urls()
-            if len(urls) == 1 and urls[0].toLocalFile().lower().endswith((".mid", ".midi")):
+            if any(u.toLocalFile().lower().endswith((".mid", ".midi"))
+                   for u in event.mimeData().urls()):
                 event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent):
-        path = event.mimeData().urls()[0].toLocalFile()
-        self.analyze(path)
+        for url in event.mimeData().urls():
+            path = url.toLocalFile()
+            if path.lower().endswith((".mid", ".midi")):
+                self.analyze(path)
 
 
 def main():
@@ -823,9 +886,10 @@ def main():
     app.set_window(window)
     window.show()
 
-    # If a file path was passed as a command-line argument, open it immediately.
-    if len(sys.argv) > 1:
-        window.analyze(sys.argv[1])
+    # If file paths were passed as command-line arguments, open them immediately.
+    for arg in sys.argv[1:]:
+        if arg.lower().endswith((".mid", ".midi")):
+            window.analyze(arg)
 
     sys.exit(app.exec())
 

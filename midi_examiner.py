@@ -15,7 +15,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # Import the database module for patch lookups
 import midi_patches_db
@@ -1337,11 +1337,12 @@ def main():
         epilog="""
 Examples:
   %(prog)s song.mid
+  %(prog)s song1.mid song2.mid song3.mid
   %(prog)s -v song.mid
   %(prog)s --json song.mid > analysis.json
         """
     )
-    parser.add_argument("midi_file", help="Path to the MIDI file to analyze")
+    parser.add_argument("midi_files", nargs='+', help="Path(s) to MIDI file(s) to analyze")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Show more detailed output")
     parser.add_argument("--json", action="store_true",
@@ -1351,19 +1352,24 @@ Examples:
 
     args = parser.parse_args()
 
-    # Analyze the file
-    try:
-        results = analyze_midi_file(args.midi_file)
-    except IOError as e:
-        print(e)
-        sys.exit(1)
+    any_error = False
+    for i, filepath in enumerate(args.midi_files):
+        if i > 0 and not args.json:
+            print()
+        try:
+            results = analyze_midi_file(filepath)
+        except IOError as e:
+            print(e, file=sys.stderr)
+            any_error = True
+            continue
+        if args.json:
+            import json
+            print(json.dumps(results, indent=2))
+        else:
+            print_results(results)
 
-    # Output results
-    if args.json:
-        import json
-        print(json.dumps(results, indent=2))
-    else:
-        print_results(results)
+    if any_error:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
