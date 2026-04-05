@@ -6,6 +6,7 @@ metadata, timing information, and message details from MIDI files.
 """
 
 import sys
+import os
 import argparse
 from collections import defaultdict
 
@@ -15,7 +16,73 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
+
+# ── Terminal colour support ───────────────────────────────────────────────────
+
+# True-color RGB, nearest xterm-256 index, basic-16 bg/fg codes.
+# Colours match the GUI sidebar: Roland orange (GS), Yamaha purple (XG),
+# forest green / lighter forest green (GM / GM2).
+_STANDARD_ANSI = {
+    #           bg_rgb               fg_rgb       bg_256  fg_256  bg_16  fg_16
+    "GM":  ((0x22, 0x8B, 0x22), (  0,   0,   0),     28,      0,    42,    30),
+    "GM2": ((0x3D, 0xAA, 0x3D), (  0,   0,   0),     71,      0,    42,    30),
+    "GS":  ((0xF2, 0x65, 0x22), (  0,   0,   0),    202,      0,    43,    30),
+    "XG":  ((0x49, 0x27, 0x86), (255, 255, 255),     54,     15,    45,    37),
+}
+
+_color_support_cache = None
+
+
+def _detect_color_support():
+    """Return 'truecolor', '256', 'basic', or 'none' for stdout."""
+    global _color_support_cache
+    if _color_support_cache is not None:
+        return _color_support_cache
+    if not sys.stdout.isatty():
+        _color_support_cache = 'none'
+        return _color_support_cache
+    colorterm = os.environ.get('COLORTERM', '').lower()
+    if colorterm in ('truecolor', '24bit'):
+        _color_support_cache = 'truecolor'
+        return _color_support_cache
+    term_program = os.environ.get('TERM_PROGRAM', '')
+    if term_program in ('iTerm.app', 'Hyper', 'WezTerm'):
+        _color_support_cache = 'truecolor'
+        return _color_support_cache
+    term = os.environ.get('TERM', '')
+    if '256color' in term or term_program in ('Apple_Terminal', 'vscode'):
+        _color_support_cache = '256'
+        return _color_support_cache
+    if 'xterm' in term or 'color' in term or term in ('screen', 'tmux'):
+        _color_support_cache = '256'
+        return _color_support_cache
+    _color_support_cache = 'basic'
+    return _color_support_cache
+
+
+def _colorize_standard(text, standard):
+    """Wrap text in ANSI escape codes matching the standard's brand colour.
+
+    Falls back gracefully through true-color → 256-colour → basic-16 → plain
+    depending on what the terminal supports.
+    """
+    support = _detect_color_support()
+    if support == 'none' or standard not in _STANDARD_ANSI:
+        return text
+    bg_rgb, fg_rgb, bg_256, fg_256, bg_basic, fg_basic = _STANDARD_ANSI[standard]
+    reset = '\033[0m'
+    if support == 'truecolor':
+        bg = f'\033[48;2;{bg_rgb[0]};{bg_rgb[1]};{bg_rgb[2]}m'
+        fg = f'\033[38;2;{fg_rgb[0]};{fg_rgb[1]};{fg_rgb[2]}m'
+    elif support == '256':
+        bg = f'\033[48;5;{bg_256}m'
+        fg = f'\033[38;5;{fg_256}m'
+    else:
+        bg = f'\033[{bg_basic}m'
+        fg = f'\033[{fg_basic}m'
+    return f'{bg}{fg}{text}{reset}'
+
 
 # Import the database module for patch lookups
 import midi_patches_db
@@ -610,11 +677,17 @@ def analyze_midi_file(filepath):
             elif msg.type == 'time_signature':
                 if "time_signature" not in results["timing"]:
                     results["timing"]["time_signature"] = []
+                notated_32nd = msg.notated_32nd_notes_per_beat
+                if notated_32nd == 0:
+                    warn = "File contains an invalid notated_32nd_notes_per_beat value of 0 in a time signature event; defaulted to 8."
+                    if warn not in results["warnings"]:
+                        results["warnings"].append(warn)
+                    notated_32nd = 8
                 results["timing"]["time_signature"].append({
                     "numerator": msg.numerator,
                     "denominator": msg.denominator,
                     "clocks_per_click": msg.clocks_per_click,
-                    "notated_32nd_notes_per_beat": msg.notated_32nd_notes_per_beat,
+                    "notated_32nd_notes_per_beat": notated_32nd,
                     "abs_time": abs_time
                 })
 
@@ -1091,7 +1164,7 @@ def print_results(results):
             suffix = f" ({upgraded_from} detected via SysEx; {upgrade_reason})"
         else:
             suffix = " (detected via SysEx)"
-        print(f"  MIDI Standard: {standard}{suffix}")
+        print(f"  MIDI Standard: {_colorize_standard(standard + suffix, standard)}")
         if standard == "GS" and "gs_info" in results:
             gs = results["gs_info"]
             sc_line = f"  Roland SC Req:  {gs['minimum_sc_version']}"

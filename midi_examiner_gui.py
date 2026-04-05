@@ -524,6 +524,39 @@ class ServiceAwareTextEdit(QTextEdit):
         menu.exec(event.globalPos())
 
 
+# Background/foreground colours for each detected MIDI standard.
+# Colours chosen to reflect brand identity; text colour maximises WCAG contrast.
+_STANDARD_STYLES = {
+    "GM":  {"bg": QColor("#228B22"), "fg": QColor("#000000")},  # forest green / black
+    "GM2": {"bg": QColor("#3DAA3D"), "fg": QColor("#000000")},  # lighter forest green / black
+    "GS":  {"bg": QColor("#F26522"), "fg": QColor("#000000")},  # Roland orange / black
+    "XG":  {"bg": QColor("#492786"), "fg": QColor("#FFFFFF")},  # Yamaha purple / white
+}
+
+
+def _apply_standard_style(item, standard, has_warnings=False, assumed=False):
+    """Apply background/foreground colour and append tag(s) to item text.
+
+    Tags appended (in order): [GM/GM2/GS/XG] [?] [!]
+      [?]  standard was assumed from bank/program messages, not from SysEx
+      [!]  file has one or more warnings
+    """
+    style = _STANDARD_STYLES.get(standard)
+    if style:
+        item.setBackground(style["bg"])
+        item.setForeground(style["fg"])
+    path = item.data(Qt.ItemDataRole.UserRole)
+    tags = []
+    if standard:
+        tags.append(f"[{standard}]")
+    if assumed:
+        tags.append("[?]")
+    if has_warnings:
+        tags.append("[!]")
+    suffix = ("  " + " ".join(tags)) if tags else ""
+    item.setText(f"{os.path.basename(path)}{suffix}")
+
+
 def _split_sections(text):
     """Split print_results() output into [(tab_label, body_text), ...] pairs.
 
@@ -554,8 +587,9 @@ def _split_sections(text):
 class AnalysisWorker(QThread):
     """Run MIDI analysis in a background thread to keep the UI responsive."""
 
-    finished = pyqtSignal(str)   # emits formatted text output
-    error = pyqtSignal(str)      # emits error message
+    # emits (formatted text, detected_standard or "", has_warnings, standard_assumed)
+    finished = pyqtSignal(str, str, bool, bool)
+    error = pyqtSignal(str)
 
     def __init__(self, filepath):
         super().__init__()
@@ -567,7 +601,10 @@ class AnalysisWorker(QThread):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 print_results(results)
-            self.finished.emit(output.getvalue())
+            standard = results.get("detected_standard") or ""
+            has_warnings = bool(results.get("warnings"))
+            assumed = bool(results.get("standard_assumed"))
+            self.finished.emit(output.getvalue(), standard, has_warnings, assumed)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -748,11 +785,23 @@ class MidiExaminerWindow(QMainWindow):
         # Horizontal splitter: sidebar (file list) on the left, tabs on the right
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
+        sidebar_widget = QWidget()
+        sidebar_layout = QVBoxLayout(sidebar_widget)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.setSpacing(4)
+
         self.sidebar = QListWidget()
         self.sidebar.setMinimumWidth(80)
         self.sidebar.setMaximumWidth(320)
         self.sidebar.currentItemChanged.connect(self._on_sidebar_selection_changed)
-        splitter.addWidget(self.sidebar)
+        sidebar_layout.addWidget(self.sidebar)
+
+        self.clear_button = QPushButton("Clear")
+        self.clear_button.setEnabled(False)
+        self.clear_button.clicked.connect(self._clear_files)
+        sidebar_layout.addWidget(self.clear_button)
+
+        splitter.addWidget(sidebar_widget)
 
         self.tab_widget = QTabWidget()
         self.tab_widget.setUsesScrollButtons(True)
@@ -791,9 +840,20 @@ class MidiExaminerWindow(QMainWindow):
         item.setData(Qt.ItemDataRole.UserRole, path)
         self.sidebar.addItem(item)
         self.sidebar.setCurrentItem(item)
+        self.clear_button.setEnabled(True)
 
         self._pending_paths.append(path)
         self._start_next_worker()
+
+    def _clear_files(self):
+        self._pending_paths.clear()
+        self._file_sections.clear()
+        self._file_order.clear()
+        self.sidebar.clear()
+        self.tab_widget.clear()
+        self.file_path_edit.clear()
+        self.clear_button.setEnabled(False)
+        self.statusBar().showMessage("Ready — open a MIDI file to begin.")
 
     def _start_next_worker(self):
         if self._active_worker_path is not None or not self._pending_paths:
@@ -806,11 +866,20 @@ class MidiExaminerWindow(QMainWindow):
         self.worker.error.connect(self._on_analysis_error)
         self.worker.start()
 
-    def _on_analysis_done(self, text):
+    def _on_analysis_done(self, text, standard, has_warnings, assumed):
         path = self._active_worker_path
-        self._file_sections[path] = _split_sections(text)
         self._active_worker_path = None
-        # Populate tabs if this file is currently selected in the sidebar
+        if path not in self._file_order:
+            # File was cleared while the worker was running; discard result.
+            self._start_next_worker()
+            return
+        self._file_sections[path] = _split_sections(text)
+        # Colour and tag the sidebar item for this file.
+        for i in range(self.sidebar.count()):
+            item = self.sidebar.item(i)
+            if item.data(Qt.ItemDataRole.UserRole) == path:
+                _apply_standard_style(item, standard, has_warnings, assumed)
+                break
         current = self.sidebar.currentItem()
         if current and current.data(Qt.ItemDataRole.UserRole) == path:
             self._populate_tabs(path)
@@ -819,8 +888,11 @@ class MidiExaminerWindow(QMainWindow):
 
     def _on_analysis_error(self, message):
         path = self._active_worker_path
-        self._file_sections[path] = [("Error", f"Error: {message}")]
         self._active_worker_path = None
+        if path not in self._file_order:
+            self._start_next_worker()
+            return
+        self._file_sections[path] = [("Error", f"Error: {message}")]
         current = self.sidebar.currentItem()
         if current and current.data(Qt.ItemDataRole.UserRole) == path:
             self._populate_tabs(path)

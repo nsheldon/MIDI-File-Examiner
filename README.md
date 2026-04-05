@@ -4,7 +4,7 @@ A tool for analyzing MIDI files, available as a macOS GUI app and a command-line
 
 ## Features
 
-- **macOS GUI app** with tabbed sections for each analysis category, drag-and-drop file loading, and automatic Light/Dark mode support
+- **macOS GUI app** with tabbed sections for each analysis category, drag-and-drop support for multiple files, a colour-coded sidebar file list, and automatic Light/Dark mode support
 - Detects the MIDI standard in use (GM, GM2, GS, XG) via SysEx messages, assumes GM when files use only base GM banks or program changes, or reports Unknown when no standard evidence is present
 - Resolves program change numbers to instrument and drum kit names using an embedded patch database
 - For Roland GS files, identifies the minimum Sound Canvas version required (SC-55, SC-88, SC-88Pro, or SC-8850) and flags CM-64 PCM/LA patch usage
@@ -174,6 +174,12 @@ python midi_examiner.py --json <midi_file> > analysis.json
 ```
 
 ## Changelog
+
+### 1.0.2
+- **GUI sidebar standard tags:** Each file in the sidebar is colour-coded by MIDI standard after analysis — forest green for GM, lighter forest green for GM2, Roland orange for GS, Yamaha purple for XG. A `[GM]`/`[GM2]`/`[GS]`/`[XG]` tag is appended to the filename. Files with an assumed standard (detected via bank/program messages rather than SysEx) show a `[?]` tag; files with warnings show a `[!]` tag.
+- **GUI sidebar Clear button:** A Clear button at the bottom of the sidebar removes all files from the list and resets the view. The button is disabled when the list is empty.
+- **CLI colour-coded MIDI Standard:** The MIDI Standard value in CLI output is colour-coded using ANSI escape codes when running in a colour-capable terminal. Supports true-color (24-bit RGB), 256-colour (nearest xterm-256 index), and basic 16-colour tiers; output is plain when piped or redirected.
+- **Fix: invalid `notated_32nd_notes_per_beat` value of 0:** Files containing a time signature meta event with `notated_32nd_notes_per_beat = 0` (an invalid value per the MIDI spec) are now handled gracefully — the value is defaulted to 8 and a warning is displayed.
 
 ### 1.0.1
 - **Multi-file support (CLI):** `midi_examiner.py` now accepts multiple file paths; each file is analyzed in sequence with a blank line separator between outputs. Exits with code 1 if any file failed, but continues analyzing remaining files.
