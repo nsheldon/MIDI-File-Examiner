@@ -7,6 +7,7 @@ metadata, timing information, and message details from MIDI files.
 
 import sys
 import os
+import io
 import argparse
 from collections import defaultdict
 
@@ -16,7 +17,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.0.3"
+__version__ = "1.1.0"
 
 # ── Terminal colour support ───────────────────────────────────────────────────
 
@@ -82,6 +83,34 @@ def _colorize_standard(text, standard):
         bg = f'\033[{bg_basic}m'
         fg = f'\033[{fg_basic}m'
     return f'{bg}{fg}{text}{reset}'
+
+
+# ── Note names and CC names (used by statistics) ─────────────────────────────
+
+_NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+
+
+def _midi_note_name(n):
+    """Convert a MIDI note number to a human-readable name (e.g. 60 → 'C4')."""
+    return f"{_NOTE_NAMES[n % 12]}{(n // 12) - 1}"
+
+
+_CC_NAMES = {
+    0: "Bank MSB",    1: "Modulation",   2: "Breath",
+    4: "Foot Ctrl",   5: "Port. Time",   6: "Data Entry",
+    7: "Volume",      8: "Balance",      10: "Pan",
+    11: "Expression", 12: "Effect 1",    13: "Effect 2",
+    32: "Bank LSB",   38: "Data LSB",
+    64: "Sustain",    65: "Portamento",  66: "Sostenuto",
+    67: "Soft Pedal", 68: "Legato",
+    71: "Resonance",  72: "Release",     73: "Attack",
+    74: "Brightness", 84: "Port. Ctrl",
+    91: "Reverb",     92: "Tremolo",     93: "Chorus",
+    94: "Celeste",    95: "Phaser",
+    96: "Data Inc",   97: "Data Dec",
+    98: "NRPN LSB",   99: "NRPN MSB",   100: "RPN LSB",  101: "RPN MSB",
+    120: "All Snd Off", 121: "Reset Ctrl", 123: "All Notes Off",
+}
 
 
 # ── Directory scanning ────────────────────────────────────────────────────────
@@ -553,12 +582,137 @@ def decode_midi_text(text):
     return text  # fall back to Latin-1 (original mido behaviour)
 
 
+def _trim_track_garbage(filepath):
+    """Return a BytesIO of the MIDI file with any bytes after each track's End
+    of Track meta event removed.
+
+    Some files (e.g. 7th Guest) store one or more padding bytes after the
+    mandatory FF 2F 00 End of Track marker.  mido reads past the EOT, tries to
+    consume another delta-time byte, and raises EOFError.  Stripping the
+    trailing bytes lets mido parse the file cleanly.
+
+    Returns None if the file does not need trimming or cannot be patched.
+    """
+    _EOT = b'\xff\x2f\x00'
+    try:
+        with open(filepath, 'rb') as f:
+            data = bytearray(f.read())
+    except OSError:
+        return None
+
+    # Locate and validate the MIDI header
+    if data[:4] != b'MThd' or len(data) < 14:
+        return None
+    hdr_len = int.from_bytes(data[4:8], 'big')
+    pos = 8 + hdr_len
+    trimmed = False
+
+    while pos + 8 <= len(data):
+        if data[pos:pos+4] != b'MTrk':
+            break
+        declared = int.from_bytes(data[pos+4:pos+8], 'big')
+        track_start = pos + 8
+        track_end   = track_start + declared
+        if track_end > len(data):
+            break
+
+        # Find the last EOT in this chunk
+        chunk = data[track_start:track_end]
+        eot_idx = chunk.rfind(_EOT)
+        if eot_idx != -1:
+            proper_end = eot_idx + len(_EOT)
+            if proper_end < len(chunk):
+                # Trailing bytes present — trim the chunk
+                new_chunk = chunk[:proper_end]
+                new_declared = len(new_chunk)
+                data[pos+4:pos+8] = new_declared.to_bytes(4, 'big')
+                data[track_start:track_end] = new_chunk
+                # Adjust subsequent offsets by recalculating the slice
+                data = (data[:track_start + new_declared]
+                        + data[track_end:])
+                track_end = track_start + new_declared
+                trimmed = True
+
+        pos = track_end
+
+    return io.BytesIO(bytes(data)) if trimmed else None
+
+
+def _compute_length(mid):
+    """Return the MIDI file length in seconds, capping each delta time at the
+    MIDI spec maximum VLQ value (0x0FFFFFFF = 268,435,455 ticks) so that a
+    single corrupt delta cannot inflate the reported song duration.
+
+    Tracks that contain any oversized delta are excluded from the end-tick
+    calculation; only clean tracks determine the song length.  If every track
+    has at least one oversized delta the capped values are used as a last
+    resort.
+
+    Also returns a bool indicating whether any delta times were capped.
+    """
+    MAX_DELTA = 0x0FFFFFFF  # MIDI spec maximum variable-length quantity
+
+    ppqn = mid.ticks_per_beat
+    if ppqn <= 0:
+        # SMPTE timing — delegate entirely to mido.
+        return mid.length, False
+
+    any_capped = False
+
+    # First pass: collect per-track end ticks, flagging tracks with bad deltas.
+    track_end_ticks  = []   # (end_tick, has_corrupt_delta) per track
+    for track in mid.tracks:
+        abs_tick     = 0
+        track_bad    = False
+        for msg in track:
+            if msg.time > MAX_DELTA:
+                abs_tick  += MAX_DELTA
+                track_bad  = True
+                any_capped = True
+            else:
+                abs_tick  += msg.time
+        track_end_ticks.append((abs_tick, track_bad))
+
+    # Prefer clean tracks when determining song length.
+    clean_ends = [t for t, bad in track_end_ticks if not bad]
+    end_tick   = max(clean_ends) if clean_ends else max(t for t, _ in track_end_ticks)
+
+    # Collect tempo changes using only clean-track positions where possible.
+    # We still scan all tracks so we don't miss a tempo event, but cap deltas
+    # on corrupt tracks so their positions are at least bounded.
+    tempo_map = []   # list of (abs_tick, tempo_us)
+    for track in mid.tracks:
+        abs_tick = 0
+        for msg in track:
+            delta     = min(msg.time, MAX_DELTA)
+            abs_tick += delta
+            if msg.type == 'set_tempo':
+                tempo_map.append((abs_tick, msg.tempo))
+    tempo_map.sort()
+
+    # Convert ticks → seconds honouring tempo changes.
+    current_tempo = 500_000   # default: 120 BPM
+    current_tick  = 0
+    total_secs    = 0.0
+
+    for change_tick, new_tempo in tempo_map:
+        if change_tick >= end_tick:
+            break
+        total_secs   += (change_tick - current_tick) * current_tempo / ppqn / 1_000_000
+        current_tick  = change_tick
+        current_tempo = new_tempo
+
+    total_secs += (end_tick - current_tick) * current_tempo / ppqn / 1_000_000
+    return total_secs, any_capped
+
+
 def _load_midi(filepath):
     """Load a MIDI file, retrying with workarounds for known mido parse errors.
 
-    Returns (mid, clipped, smpte_fallback) where clipped indicates note values
-    were clamped and smpte_fallback indicates an invalid SMPTE frame-rate code
-    was ignored during parsing.
+    Returns (mid, clipped, smpte_fallback, trim_fallback) where clipped
+    indicates note values were clamped, smpte_fallback indicates an invalid
+    SMPTE frame-rate code was ignored, and trim_fallback indicates trailing
+    bytes after an End of Track marker were stripped.
     Raises IOError with a descriptive message if the file cannot be read.
     """
     import mido.midifiles.meta as _meta
@@ -587,13 +741,28 @@ def _load_midi(filepath):
         finally:
             _meta.MetaSpec_smpte_offset.decode = orig_decode
 
+    def _try_load_trimmed(clip):
+        # Some files have padding bytes after the End of Track marker inside
+        # one or more track chunks, which causes mido to raise EOFError.
+        # Strip the garbage and reload from an in-memory BytesIO.
+        buf = _trim_track_garbage(filepath)
+        if buf is None:
+            raise ValueError("no trimming needed or possible")
+        return mido.MidiFile(file=buf, clip=clip)
+
     for clip in (False, True):
         try:
-            return _try_load(clip), clip, False
+            return _try_load(clip), clip, False, False
+        except EOFError:
+            # Likely trailing garbage after an End of Track marker.
+            try:
+                return _try_load_trimmed(clip), clip, False, True
+            except Exception:
+                pass
         except KeyError:
             # Likely an unrecognised SMPTE frame-rate code — retry with patch.
             try:
-                return _try_load_smpte_tolerant(clip), clip, True
+                return _try_load_smpte_tolerant(clip), clip, True, False
             except Exception:
                 pass
         except Exception:
@@ -609,7 +778,7 @@ def _load_midi(filepath):
 
 def analyze_midi_file(filepath):
     """Analyze a MIDI file and return structured data."""
-    mid, clipped, smpte_fallback = _load_midi(filepath)
+    mid, clipped, smpte_fallback, trim_fallback = _load_midi(filepath)
 
     results = {
         "file_info": {},
@@ -634,12 +803,25 @@ def analyze_midi_file(filepath):
             "File contains an unrecognised SMPTE frame-rate code in a SMPTE Offset meta event "
             "(0xFF 0x54); the frame rate was ignored and defaulted to 24 fps."
         )
+    if trim_fallback:
+        results["warnings"].append(
+            "File contains trailing bytes after an End of Track marker in one or more track "
+            "chunks; the extra bytes were ignored during parsing."
+        )
+
+    length_secs, delta_capped = _compute_length(mid)
+    results["file_info"]["length_seconds"] = length_secs
+    if delta_capped:
+        results["warnings"].append(
+            "File contains one or more delta times exceeding the MIDI spec maximum "
+            "(0x0FFFFFFF ticks); oversized deltas were capped when computing song length."
+        )
 
     # File info
     results["file_info"]["filename"] = filepath
     results["file_info"]["format"] = mid.type
     results["file_info"]["num_tracks"] = len(mid.tracks)
-    results["file_info"]["length_seconds"] = mid.length
+    results["file_info"]["length_seconds"] = length_secs
 
     # PPQN / Ticks per beat
     results["timing"]["ppqn"] = mid.ticks_per_beat
@@ -1070,7 +1252,164 @@ def analyze_midi_file(filepath):
     if detected_standard == "XG":
         results["xg_info"] = determine_minimum_xg_level(results)
 
+    # Collect per-channel / per-track statistics
+    _collect_statistics(mid, results)
+
     return results
+
+
+def _collect_statistics(mid, results):
+    """Collect per-channel and per-track event statistics from the MIDI data.
+
+    Runs a separate pass over the raw MIDI messages so that the main analysis
+    loop stays uncluttered.  Results are stored in results["statistics"].
+    """
+    ppqn = mid.ticks_per_beat if mid.ticks_per_beat > 0 else 480
+
+    ch_acc = {}   # channel (1-indexed) -> accumulator dict
+    tr_acc = {}   # track index -> accumulator dict
+
+    def _ch(ch):
+        if ch not in ch_acc:
+            ch_acc[ch] = {
+                "note_count": 0,
+                "pitch_min": 127, "pitch_max": 0,
+                "vel_min": 127,   "vel_max": 0,  "vel_sum": 0,
+                "dur_ticks": [],
+                "pending": {},    # pitch -> abs_tick of most-recent note-on
+                "active":  set(), # currently sounding pitches (polyphony)
+                "peak_poly": 0,
+                "cc": {},         # cc_num -> event count
+                "pb_count": 0, "pb_min": 8191, "pb_max": -8192,
+                "at_count": 0, "at_min": 127,  "at_max": 0,
+                "poly_at_count": 0,
+            }
+        return ch_acc[ch]
+
+    def _tr(ti):
+        if ti not in tr_acc:
+            tr_acc[ti] = {
+                "note_on": 0, "note_off": 0,
+                "cc": 0, "pb": 0, "at": 0, "poly_at": 0, "sysex": 0,
+            }
+        return tr_acc[ti]
+
+    global_active = {}   # (channel, pitch) -> True
+    global_peak   = 0
+    totals = {
+        "note_on": 0, "note_off": 0, "control_change": 0,
+        "pitch_bend": 0, "aftertouch": 0, "poly_aftertouch": 0,
+        "program_change": 0, "sysex": 0,
+    }
+
+    for track_idx, track in enumerate(mid.tracks):
+        tr  = _tr(track_idx)
+        abs_time = 0
+        for msg in track:
+            abs_time += msg.time
+            if msg.is_meta:
+                continue
+            ch = getattr(msg, 'channel', None)
+            if ch is not None:
+                ch += 1   # convert to 1-indexed
+            t = msg.type
+
+            if t == 'note_on' and msg.velocity > 0:
+                c = _ch(ch)
+                tr["note_on"] += 1;  totals["note_on"] += 1
+                c["note_count"] += 1
+                if msg.note < c["pitch_min"]: c["pitch_min"] = msg.note
+                if msg.note > c["pitch_max"]: c["pitch_max"] = msg.note
+                if msg.velocity < c["vel_min"]: c["vel_min"] = msg.velocity
+                if msg.velocity > c["vel_max"]: c["vel_max"] = msg.velocity
+                c["vel_sum"] += msg.velocity
+                c["pending"][msg.note] = abs_time
+                c["active"].add(msg.note)
+                if len(c["active"]) > c["peak_poly"]:
+                    c["peak_poly"] = len(c["active"])
+                global_active[(ch, msg.note)] = True
+                if len(global_active) > global_peak:
+                    global_peak = len(global_active)
+
+            elif t == 'note_off' or (t == 'note_on' and msg.velocity == 0):
+                c = _ch(ch)
+                tr["note_off"] += 1;  totals["note_off"] += 1
+                c["active"].discard(msg.note)
+                global_active.pop((ch, msg.note), None)
+                start = c["pending"].pop(msg.note, None)
+                if start is not None:
+                    c["dur_ticks"].append(abs_time - start)
+
+            elif t == 'control_change':
+                c = _ch(ch)
+                tr["cc"] += 1;  totals["control_change"] += 1
+                c["cc"][msg.control] = c["cc"].get(msg.control, 0) + 1
+
+            elif t == 'pitchwheel':
+                c = _ch(ch)
+                tr["pb"] += 1;  totals["pitch_bend"] += 1
+                c["pb_count"] += 1
+                if msg.pitch < c["pb_min"]: c["pb_min"] = msg.pitch
+                if msg.pitch > c["pb_max"]: c["pb_max"] = msg.pitch
+
+            elif t == 'aftertouch':
+                c = _ch(ch)
+                tr["at"] += 1;  totals["aftertouch"] += 1
+                c["at_count"] += 1
+                if msg.value < c["at_min"]: c["at_min"] = msg.value
+                if msg.value > c["at_max"]: c["at_max"] = msg.value
+
+            elif t == 'polytouch':
+                c = _ch(ch)
+                tr["poly_at"] += 1;  totals["poly_aftertouch"] += 1
+                c["poly_at_count"] += 1
+
+            elif t == 'program_change':
+                totals["program_change"] += 1
+
+            elif t == 'sysex':
+                tr["sysex"] += 1;  totals["sysex"] += 1
+
+    # ── Convert accumulators to clean, JSON-serialisable dicts ────────────────
+
+    by_channel = {}
+    for ch in sorted(ch_acc):
+        a = ch_acc[ch]
+        entry = {"note_count": a["note_count"]}
+        if a["note_count"] > 0:
+            entry["pitch_min"]      = a["pitch_min"]
+            entry["pitch_max"]      = a["pitch_max"]
+            entry["vel_min"]        = a["vel_min"]
+            entry["vel_max"]        = a["vel_max"]
+            entry["vel_avg"]        = round(a["vel_sum"] / a["note_count"], 1)
+            entry["peak_polyphony"] = a["peak_poly"]
+            if a["dur_ticks"]:
+                entry["dur_avg_beats"] = round(
+                    sum(a["dur_ticks"]) / len(a["dur_ticks"]) / ppqn, 3)
+                entry["dur_min_beats"] = round(min(a["dur_ticks"]) / ppqn, 3)
+                entry["dur_max_beats"] = round(max(a["dur_ticks"]) / ppqn, 3)
+        if a["cc"]:
+            entry["control_changes"] = {k: v for k, v in sorted(a["cc"].items())}
+        if a["pb_count"]:
+            entry["pitch_bend"] = {
+                "count": a["pb_count"], "min": a["pb_min"], "max": a["pb_max"],
+            }
+        if a["at_count"]:
+            entry["aftertouch"] = {
+                "count": a["at_count"], "min": a["at_min"], "max": a["at_max"],
+            }
+        if a["poly_at_count"]:
+            entry["poly_aftertouch_count"] = a["poly_at_count"]
+        by_channel[ch] = entry
+
+    by_track = {ti: dict(a) for ti, a in sorted(tr_acc.items())}
+
+    results["statistics"] = {
+        "by_channel":          by_channel,
+        "by_track":            by_track,
+        "totals":              totals,
+        "global_peak_polyphony": global_peak,
+    }
 
 
 def sanitize_text(text):
@@ -1094,6 +1433,120 @@ def print_section(title):
 def print_subsection(title):
     """Print a subsection header."""
     print(f"\n--- {title} ---")
+
+
+def _print_statistics(results):
+    """Print the STATISTICS section."""
+    stats = results.get("statistics")
+    if not stats:
+        return
+
+    percussion_channels = {
+        pc["channel"] for pc in results.get("program_changes", [])
+        if pc.get("is_percussion")
+    }
+
+    print_section("STATISTICS")
+
+    by_channel = stats["by_channel"]
+
+    # ── Notes by channel ──────────────────────────────────────────────────────
+    note_channels = {ch: d for ch, d in by_channel.items() if d["note_count"] > 0}
+    if note_channels:
+        print_subsection("Notes by Channel")
+        for ch, d in sorted(note_channels.items()):
+            is_perc = ch in percussion_channels
+            print(f"  Ch {ch:2d}" + (" (Perc):" if is_perc else ":"))
+            print(f"    Notes:      {d['note_count']:,}")
+            print(f"    Pitch:      {_midi_note_name(d['pitch_min'])}–{_midi_note_name(d['pitch_max'])}")
+            print(f"    Velocity:   {d['vel_min']}–{d['vel_max']}  avg {d['vel_avg']:.0f}")
+            if "dur_avg_beats" in d:
+                print(f"    Duration:   {d['dur_min_beats']:.2f}–{d['dur_max_beats']:.2f}  avg {d['dur_avg_beats']:.2f} beats")
+            print(f"    Polyphony:  peak {d['peak_polyphony']}")
+
+    # ── Control changes by channel ────────────────────────────────────────────
+    cc_channels = {ch: d for ch, d in by_channel.items() if d.get("control_changes")}
+    if cc_channels:
+        print_subsection("Control Changes by Channel")
+        for ch, d in sorted(cc_channels.items()):
+            print(f"  Ch {ch:2d}:")
+            for cc_num, count in sorted(d["control_changes"].items()):
+                name = _CC_NAMES.get(cc_num)
+                label = f"CC {cc_num:3d}"
+                if name:
+                    label += f" ({name})"
+                print(f"    {label} ×{count}")
+
+    # ── Pitch bend by channel ─────────────────────────────────────────────────
+    pb_channels = {ch: d for ch, d in by_channel.items() if d.get("pitch_bend")}
+    if pb_channels:
+        print_subsection("Pitch Bend by Channel")
+        for ch, d in sorted(pb_channels.items()):
+            pb = d["pitch_bend"]
+            print(f"  Ch {ch:2d}:")
+            print(f"    Events:     {pb['count']:,}")
+            print(f"    Range:      {pb['min']:+d} to {pb['max']:+d}  (full range: ±8191)")
+
+    # ── Aftertouch by channel ─────────────────────────────────────────────────
+    at_channels      = {ch: d for ch, d in by_channel.items() if d.get("aftertouch")}
+    poly_at_channels = {ch: d for ch, d in by_channel.items()
+                        if d.get("poly_aftertouch_count", 0) > 0}
+    if at_channels or poly_at_channels:
+        print_subsection("Aftertouch by Channel")
+        if at_channels:
+            print("  Channel Aftertouch:")
+            for ch, d in sorted(at_channels.items()):
+                at = d["aftertouch"]
+                print(f"    Ch {ch:2d}:")
+                print(f"      Events:   {at['count']:,}")
+                print(f"      Range:    {at['min']}–{at['max']}")
+        if poly_at_channels:
+            print("  Polyphonic Aftertouch:")
+            for ch, d in sorted(poly_at_channels.items()):
+                print(f"    Ch {ch:2d}:")
+                print(f"      Events:   {d['poly_aftertouch_count']:,}")
+
+    # ── Per-track event breakdown ─────────────────────────────────────────────
+    by_track = stats["by_track"]
+    perf_tracks = {
+        ti: d for ti, d in by_track.items()
+        if any(d[k] > 0 for k in ("note_on", "cc", "pb", "at", "poly_at", "sysex"))
+    }
+    if perf_tracks:
+        print_subsection("Event Breakdown by Track")
+        for ti, d in sorted(perf_tracks.items()):
+            name = ""
+            if ti < len(results["tracks"]):
+                tn = results["tracks"][ti].get("name")
+                if tn:
+                    name = f" ({sanitize_text(tn)[:24]})"
+            print(f"  Trk {ti:2d}{name}:")
+            if d["note_on"]:  print(f"    Notes:      {d['note_on']:,}")
+            if d["cc"]:       print(f"    CC:         {d['cc']:,}")
+            if d["pb"]:       print(f"    Pitch Bend: {d['pb']:,}")
+            if d["at"]:       print(f"    Aftertouch: {d['at']:,}")
+            if d["poly_at"]:  print(f"    Poly AT:    {d['poly_at']:,}")
+            if d["sysex"]:    print(f"    SysEx:      {d['sysex']:,}")
+
+    # ── Event totals ──────────────────────────────────────────────────────────
+    print_subsection("Event Totals")
+    t = stats["totals"]
+    rows = [
+        ("Note On",            t["note_on"]),
+        ("Note Off",           t["note_off"]),
+        ("Control Changes",    t["control_change"]),
+        ("Pitch Bend",         t["pitch_bend"]),
+        ("Channel Aftertouch", t["aftertouch"]),
+        ("Poly Aftertouch",    t["poly_aftertouch"]),
+        ("Program Changes",    t["program_change"]),
+        ("SysEx",              t["sysex"]),
+    ]
+    for label, value in rows:
+        if value > 0:
+            print(f"  {label:<22} {value:>7,}")
+    gp = stats.get("global_peak_polyphony", 0)
+    if gp:
+        print(f"  {'Global Peak Polyphony':<22} {gp:>7}")
 
 
 def _karaoke_lyric_texts(text_events):
@@ -1481,6 +1934,9 @@ def print_results(results):
                     print(f"    Program {pc['program']:3d}{name_str}{bank_info}{assumed}")
     else:
         print("  (No program changes found)")
+
+    # Statistics
+    _print_statistics(results)
 
     print("\n" + "=" * 60)
     print(" END OF ANALYSIS")

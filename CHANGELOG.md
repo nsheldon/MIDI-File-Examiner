@@ -1,5 +1,10 @@
 # Changelog
 
+### 1.1.0
+- **Statistics section:** A new STATISTICS section at the end of the output provides per-channel and per-track analysis of MIDI data. Per-channel stats include note count, velocity range and average, note duration range and average (in ms), peak polyphony, control change message counts grouped by CC number and name, pitch bend message count and value range, channel aftertouch count and value range, and polyphonic aftertouch count. Per-track stats include total event count broken down by message type (note on/off, control change, pitch bend, program change, channel/poly aftertouch, SysEx, meta).
+- **Fix: corrupt oversized delta times inflating song length:** MIDI files containing a single delta time larger than the MIDI spec maximum VLQ (0x0FFFFFFF = 268,435,455 ticks) — as seen in certain Descent 2 MIDI files — now report a correct song length. Tracks containing oversized deltas are excluded from the end-tick calculation; clean tracks determine the authoritative duration. A warning is displayed when oversized deltas are detected.
+- **Fix: trailing bytes after End of Track causing load failure:** MIDI files with extra bytes appended inside a track chunk after the `FF 2F 00` End of Track marker — as seen in 7th Guest MIDI files — now load successfully. The extra bytes are stripped in memory before parsing, and a warning is displayed.
+
 ### 1.0.3
 - **Directory scanning (CLI and GUI):** Accepts directories as input in addition to individual files. Directories are scanned recursively up to 3 levels deep for `.mid`/`.midi` files; a warning is generated if MIDI files exist beyond that depth. CLI accepts directory paths alongside file paths. GUI adds an **Open Folder…** button next to the existing Open button, an **Open Folder…** menu item, and accepts dragged folders — opening a folder replaces the current sidebar list. Sidebar entries from directory scans are visually indented with a `›` indicator relative to their depth from the scan root.
 - **GUI sidebar `[KAR]` tag:** Files identified as Soft Karaoke format show a `[KAR]` tag in the sidebar after analysis.
