@@ -4,7 +4,7 @@ A tool for analyzing MIDI files, available as a macOS GUI app and a command-line
 
 ## Features
 
-- **macOS GUI app** with tabbed sections for each analysis category, drag-and-drop support for multiple files, a colour-coded sidebar file list, and automatic Light/Dark mode support
+- **macOS GUI app** with tabbed sections for each analysis category, drag-and-drop support for multiple files and folders, a colour-coded sidebar file list with depth indentation for directory scans, and automatic Light/Dark mode support
 - Detects the MIDI standard in use (GM, GM2, GS, XG) via SysEx messages, assumes GM when files use only base GM banks or program changes, or reports Unknown when no standard evidence is present
 - Resolves program change numbers to instrument and drum kit names using an embedded patch database
 - For Roland GS files, identifies the minimum Sound Canvas version required (SC-55, SC-88, SC-88Pro, or SC-8850) and flags CM-64 PCM/LA patch usage
@@ -174,6 +174,14 @@ python midi_examiner.py --json <midi_file> > analysis.json
 ```
 
 ## Changelog
+
+### 1.0.3
+- **Directory scanning (CLI and GUI):** Accepts directories as input in addition to individual files. Directories are scanned recursively up to 3 levels deep for `.mid`/`.midi` files; a warning is generated if MIDI files exist beyond that depth. CLI accepts directory paths alongside file paths. GUI adds an **Open Folder…** button next to the existing Open button, an **Open Folder…** menu item, and accepts dragged folders — opening a folder replaces the current sidebar list. Sidebar entries from directory scans are visually indented with a `›` indicator relative to their depth from the scan root.
+- **GUI sidebar `[KAR]` tag:** Files identified as Soft Karaoke format show a `[KAR]` tag in the sidebar after analysis.
+- **File size in File Info:** A File Size line is displayed below the filename in the File Info section, showing KB (with raw byte count) or MB for larger files.
+- **Fix: Soft Karaoke detection with variant markers:** The `@KMIDI KARAOKE FILE` marker is now matched with `startswith` rather than exact equality, handling files that append a suffix (e.g. `tm`). The version tag is correctly parsed from `@V` (not `@KV`).
+- **Fix: KAR lyrics paragraph spacing:** Blank lines between paragraphs now appear after the last line of a phrase rather than before the first line, matching the intended `\` (new paragraph) / `/` (new line) semantics.
+- **Fix: truncated multibyte track name decoding:** Track names whose raw bytes end with an incomplete Shift-JIS (CP932) or EUC-JP lead byte — common in fixed-width MIDI name fields — now decode correctly instead of falling back to garbled Latin-1.
 
 ### 1.0.2
 - **GUI sidebar standard tags:** Each file in the sidebar is colour-coded by MIDI standard after analysis — forest green for GM, lighter forest green for GM2, Roland orange for GS, Yamaha purple for XG. A `[GM]`/`[GM2]`/`[GS]`/`[XG]` tag is appended to the filename. Files with an assumed standard (detected via bank/program messages rather than SysEx) show a `[?]` tag; files with warnings show a `[!]` tag.

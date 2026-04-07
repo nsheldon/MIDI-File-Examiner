@@ -29,7 +29,7 @@ except ImportError:
 # midi_examiner and midi_patches_db can always be found.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from midi_examiner import __version__, analyze_midi_file, print_results
+from midi_examiner import __version__, analyze_midi_file, print_results, collect_midi_files
 
 # Mapping from ALL-CAPS section titles (as printed) to shorter tab labels.
 _TAB_LABELS = {
@@ -534,12 +534,13 @@ _STANDARD_STYLES = {
 }
 
 
-def _apply_standard_style(item, standard, has_warnings=False, assumed=False):
+def _apply_standard_style(item, standard, has_warnings=False, assumed=False, is_karaoke=False):
     """Apply background/foreground colour and append tag(s) to item text.
 
-    Tags appended (in order): [GM/GM2/GS/XG] [?] [!]
-      [?]  standard was assumed from bank/program messages, not from SysEx
-      [!]  file has one or more warnings
+    Tags appended (in order): [GM/GM2/GS/XG] [KAR] [?] [!]
+      [KAR] file is Soft Karaoke format
+      [?]   standard was assumed from bank/program messages, not from SysEx
+      [!]   file has one or more warnings
     """
     style = _STANDARD_STYLES.get(standard)
     if style:
@@ -549,12 +550,18 @@ def _apply_standard_style(item, standard, has_warnings=False, assumed=False):
     tags = []
     if standard:
         tags.append(f"[{standard}]")
+    if is_karaoke:
+        tags.append("[KAR]")
     if assumed:
         tags.append("[?]")
     if has_warnings:
         tags.append("[!]")
     suffix = ("  " + " ".join(tags)) if tags else ""
-    item.setText(f"{os.path.basename(path)}{suffix}")
+    # Use the stored base label (set at item creation) so the depth-indentation
+    # prefix is preserved regardless of how many times this function is called.
+    base = item.data(Qt.ItemDataRole.UserRole.value + 1) \
+        or os.path.basename(item.data(Qt.ItemDataRole.UserRole))
+    item.setText(f"{base}{suffix}")
 
 
 def _split_sections(text):
@@ -587,8 +594,8 @@ def _split_sections(text):
 class AnalysisWorker(QThread):
     """Run MIDI analysis in a background thread to keep the UI responsive."""
 
-    # emits (formatted text, detected_standard or "", has_warnings, standard_assumed)
-    finished = pyqtSignal(str, str, bool, bool)
+    # emits (formatted text, detected_standard or "", has_warnings, standard_assumed, is_karaoke)
+    finished = pyqtSignal(str, str, bool, bool, bool)
     error = pyqtSignal(str)
 
     def __init__(self, filepath):
@@ -604,7 +611,8 @@ class AnalysisWorker(QThread):
             standard = results.get("detected_standard") or ""
             has_warnings = bool(results.get("warnings"))
             assumed = bool(results.get("standard_assumed"))
-            self.finished.emit(output.getvalue(), standard, has_warnings, assumed)
+            is_karaoke = bool(results.get("karaoke"))
+            self.finished.emit(output.getvalue(), standard, has_warnings, assumed, is_karaoke)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -746,6 +754,10 @@ class MidiExaminerWindow(QMainWindow):
         open_action.triggered.connect(self.open_file_dialog)
         file_menu.addAction(open_action)
 
+        open_folder_action = QAction("Open Folder…", self)
+        open_folder_action.triggered.connect(self.open_folder_dialog)
+        file_menu.addAction(open_folder_action)
+
         file_menu.addSeparator()
 
         quit_action = QAction("Quit", self)
@@ -778,8 +790,11 @@ class MidiExaminerWindow(QMainWindow):
         self.file_path_edit.setReadOnly(True)
         self.open_button = QPushButton("Open…")
         self.open_button.clicked.connect(self.open_file_dialog)
+        self.open_folder_button = QPushButton("Open Folder…")
+        self.open_folder_button.clicked.connect(self.open_folder_dialog)
         file_bar.addWidget(self.file_path_edit)
         file_bar.addWidget(self.open_button)
+        file_bar.addWidget(self.open_folder_button)
         layout.addLayout(file_bar)
 
         # Horizontal splitter: sidebar (file list) on the left, tabs on the right
@@ -828,7 +843,58 @@ class MidiExaminerWindow(QMainWindow):
         for path in paths:
             self.analyze(path)
 
-    def analyze(self, path):
+    def open_folder_dialog(self):
+        folder = QFileDialog.getExistingDirectory(
+            self,
+            "Open Folder",
+            "",
+        )
+        if folder:
+            self._open_paths([folder])
+
+    def _open_paths(self, paths):
+        """Expand a list of file/directory paths and queue each MIDI file for analysis.
+
+        Directories are scanned recursively up to 3 levels deep.  If any files
+        were excluded due to the depth limit a warning dialog is shown.
+        """
+        from PyQt6.QtWidgets import QMessageBox
+        # Opening a folder replaces the current list rather than appending to it.
+        if any(os.path.isdir(p) for p in paths):
+            self._clear_files()
+        all_warnings = []
+        for path in paths:
+            if os.path.isdir(path):
+                files, warnings = collect_midi_files(path)
+                all_warnings.extend(warnings)
+                if not files:
+                    all_warnings.append(f"No MIDI files found in: {os.path.basename(path)}")
+                for f in files:
+                    rel = os.path.relpath(f, path)
+                    depth = len(rel.split(os.sep)) - 1
+                    self.analyze(f, depth=depth)
+            else:
+                self.analyze(path)
+        if all_warnings:
+            QMessageBox.warning(
+                self,
+                "Directory Scan Warning",
+                "\n".join(all_warnings),
+            )
+
+    @staticmethod
+    def _sidebar_label(name, depth):
+        """Build a display label that visually indents *name* by *depth* levels.
+
+        Depth 0 (root or individually opened file) has no prefix.
+        Each level adds two non-breaking spaces plus a › indicator.
+        """
+        if depth <= 0:
+            return name
+        indent = "\u00A0\u00A0" * depth  # non-breaking spaces so Qt won't collapse them
+        return f"{indent}›\u00A0{name}"
+
+    def analyze(self, path, depth=0):
         # Already in the sidebar (analyzed or queued) — just select it.
         if path in self._file_sections or path in self._pending_paths \
                 or path == self._active_worker_path:
@@ -836,8 +902,10 @@ class MidiExaminerWindow(QMainWindow):
             return
 
         self._file_order.append(path)
-        item = QListWidgetItem(os.path.basename(path))
+        label = self._sidebar_label(os.path.basename(path), depth)
+        item = QListWidgetItem(label)
         item.setData(Qt.ItemDataRole.UserRole, path)
+        item.setData(Qt.ItemDataRole.UserRole.value + 1, label)  # base label (no tags)
         self.sidebar.addItem(item)
         self.sidebar.setCurrentItem(item)
         self.clear_button.setEnabled(True)
@@ -866,7 +934,7 @@ class MidiExaminerWindow(QMainWindow):
         self.worker.error.connect(self._on_analysis_error)
         self.worker.start()
 
-    def _on_analysis_done(self, text, standard, has_warnings, assumed):
+    def _on_analysis_done(self, text, standard, has_warnings, assumed, is_karaoke):
         path = self._active_worker_path
         self._active_worker_path = None
         if path not in self._file_order:
@@ -878,7 +946,7 @@ class MidiExaminerWindow(QMainWindow):
         for i in range(self.sidebar.count()):
             item = self.sidebar.item(i)
             if item.data(Qt.ItemDataRole.UserRole) == path:
-                _apply_standard_style(item, standard, has_warnings, assumed)
+                _apply_standard_style(item, standard, has_warnings, assumed, is_karaoke)
                 break
         current = self.sidebar.currentItem()
         if current and current.data(Qt.ItemDataRole.UserRole) == path:
@@ -933,15 +1001,21 @@ class MidiExaminerWindow(QMainWindow):
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
-            if any(u.toLocalFile().lower().endswith((".mid", ".midi"))
-                   for u in event.mimeData().urls()):
+            if any(
+                u.toLocalFile().lower().endswith((".mid", ".midi"))
+                or os.path.isdir(u.toLocalFile())
+                for u in event.mimeData().urls()
+            ):
                 event.acceptProposedAction()
 
     def dropEvent(self, event: QDropEvent):
+        paths = []
         for url in event.mimeData().urls():
             path = url.toLocalFile()
-            if path.lower().endswith((".mid", ".midi")):
-                self.analyze(path)
+            if path.lower().endswith((".mid", ".midi")) or os.path.isdir(path):
+                paths.append(path)
+        if paths:
+            self._open_paths(paths)
 
 
 def main():
@@ -958,10 +1032,13 @@ def main():
     app.set_window(window)
     window.show()
 
-    # If file paths were passed as command-line arguments, open them immediately.
-    for arg in sys.argv[1:]:
-        if arg.lower().endswith((".mid", ".midi")):
-            window.analyze(arg)
+    # If file paths or directories were passed as command-line arguments, open them immediately.
+    cli_paths = [
+        arg for arg in sys.argv[1:]
+        if arg.lower().endswith((".mid", ".midi")) or os.path.isdir(arg)
+    ]
+    if cli_paths:
+        window._open_paths(cli_paths)
 
     sys.exit(app.exec())
 

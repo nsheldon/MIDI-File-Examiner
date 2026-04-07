@@ -16,7 +16,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 # ── Terminal colour support ───────────────────────────────────────────────────
 
@@ -82,6 +82,60 @@ def _colorize_standard(text, standard):
         bg = f'\033[{bg_basic}m'
         fg = f'\033[{fg_basic}m'
     return f'{bg}{fg}{text}{reset}'
+
+
+# ── Directory scanning ────────────────────────────────────────────────────────
+
+def _scan_directory(root, max_depth=3):
+    """Return (files, warnings) for all MIDI files in *root* up to *max_depth* levels deep.
+
+    Depth is measured from *root* itself (depth 0).  Files directly inside
+    *root* are at depth 0; files one folder down are at depth 1, and so on.
+    Files found at depth > *max_depth* are not included, and a warning is
+    generated if any such files exist.
+    """
+    included = []
+    excluded_count = 0
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == '.' else len(rel.split(os.sep))
+
+        midi_here = [f for f in filenames if f.lower().endswith(('.mid', '.midi'))]
+
+        if depth <= max_depth:
+            for name in sorted(midi_here):
+                included.append(os.path.join(dirpath, name))
+        else:
+            excluded_count += len(midi_here)
+            # Prune deeper descent — no need to go further once we're past the limit.
+            dirnames.clear()
+
+    warnings = []
+    if excluded_count:
+        warnings.append(
+            f"Directory scan limited to {max_depth} level(s) deep; "
+            f"{excluded_count} MIDI file(s) in deeper subdirectories were not included."
+        )
+
+    return included, warnings
+
+
+def collect_midi_files(path, max_depth=3):
+    """Collect MIDI file paths from *path* (a file or directory).
+
+    If *path* is a MIDI file, returns ([path], []).
+    If *path* is a directory, scans recursively up to *max_depth* levels.
+    Returns (files, warnings).
+    """
+    path = os.path.abspath(path)
+    if os.path.isfile(path):
+        if path.lower().endswith(('.mid', '.midi')):
+            return [path], []
+        return [], []
+    if os.path.isdir(path):
+        return _scan_directory(path, max_depth)
+    return [], []
 
 
 # Import the database module for patch lookups
@@ -486,6 +540,16 @@ def decode_midi_text(text):
         except (UnicodeDecodeError, LookupError):
             continue
 
+    # Lenient retry: tolerate truncated multibyte sequences (e.g. an incomplete
+    # Shift-JIS lead byte at the end of a fixed-width track-name field).
+    for encoding in ('cp932', 'euc-jp', 'utf-8'):
+        try:
+            decoded = raw.decode(encoding, errors='ignore')
+            if decoded.strip():
+                return decoded
+        except LookupError:
+            continue
+
     return text  # fall back to Latin-1 (original mido behaviour)
 
 
@@ -878,7 +942,8 @@ def analyze_midi_file(filepath):
     results["standard_upgrade_reason"] = standard_upgrade_reason
 
     # Detect Soft Karaoke (KAR) format: look for the canonical @KMIDI marker
-    # in text events.  Collect @KV version, @T titles, @L language, @I info.
+    # in text events.  Collect @V version, @T titles, @L language, @I info.
+    # The marker may have a trailing suffix (e.g. "tm"), so use startswith.
     kar_version = None
     kar_titles = []
     kar_languages = []
@@ -886,10 +951,10 @@ def analyze_midi_file(filepath):
     is_karaoke = False
     for evt in results["text_events"]:
         t = evt["text"].strip()
-        if t == "@KMIDI KARAOKE FILE":
+        if t.startswith("@KMIDI KARAOKE FILE"):
             is_karaoke = True
-        elif t.startswith("@KV"):
-            kar_version = t[3:].strip()
+        elif t.startswith("@V"):
+            kar_version = t[2:].strip()
         elif t.startswith("@T"):
             kar_titles.append(t[2:].strip())
         elif t.startswith("@L"):
@@ -1052,8 +1117,14 @@ def _karaoke_lyric_texts(text_events):
 def _assemble_karaoke_lines(raw_texts):
     """Assemble a list of raw karaoke syllable strings into (is_para, line) pairs.
 
-    Syllables starting with \\ begin a new paragraph (blank line before);
-    syllables starting with / begin a new line within a paragraph.
+    Syllables starting with \\ begin a new paragraph (blank line before the
+    line they start); syllables starting with / begin a new line within the
+    current paragraph (no blank line).
+
+    The is_para flag is carried forward and attached to the line being
+    *started*, not to the line being flushed, so blank lines appear in the
+    right place.
+
     Returns a list of (is_paragraph_break, assembled_line) tuples, or an
     empty list if no line-break markers are present.
     """
@@ -1061,17 +1132,19 @@ def _assemble_karaoke_lines(raw_texts):
         return []
     lines = []
     current = ""
+    next_is_para = False
     first = True
     for text in raw_texts:
         if text.startswith("\\") or text.startswith("/"):
             if current.strip() or not first:
-                lines.append((text.startswith("\\"), current.rstrip()))
+                lines.append((next_is_para, current.rstrip()))
+            next_is_para = text.startswith("\\")
             current = text[1:]
             first = False
         else:
             current += text
     if current.strip():
-        lines.append((False, current.rstrip()))
+        lines.append((next_is_para, current.rstrip()))
     return lines
 
 
@@ -1143,6 +1216,17 @@ def print_results(results):
     print_section("FILE INFORMATION")
     info = results["file_info"]
     print(f"  Filename:      {info['filename']}")
+    try:
+        size_bytes = os.path.getsize(info['filename'])
+        if size_bytes < 1024:
+            size_str = f"{size_bytes} bytes"
+        elif size_bytes < 1024 * 1024:
+            size_str = f"{size_bytes / 1024:.1f} KB ({size_bytes:,} bytes)"
+        else:
+            size_str = f"{size_bytes / (1024 * 1024):.2f} MB ({size_bytes:,} bytes)"
+        print(f"  File Size:     {size_str}")
+    except OSError:
+        pass
     format_names = {0: "Single Track (Type 0)", 1: "Multi Track (Type 1)", 2: "Multi Song (Type 2)"}
     format_type = info['format']
     format_desc = format_names.get(format_type, f"Unknown ({format_type})")
@@ -1415,7 +1499,8 @@ Examples:
   %(prog)s --json song.mid > analysis.json
         """
     )
-    parser.add_argument("midi_files", nargs='+', help="Path(s) to MIDI file(s) to analyze")
+    parser.add_argument("midi_files", nargs='+',
+                        help="Path(s) to MIDI file(s) or director(ies) to analyze")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Show more detailed output")
     parser.add_argument("--json", action="store_true",
@@ -1425,8 +1510,24 @@ Examples:
 
     args = parser.parse_args()
 
+    # Expand directories into individual MIDI file paths.
+    expanded_paths = []
     any_error = False
-    for i, filepath in enumerate(args.midi_files):
+    for path in args.midi_files:
+        if os.path.isdir(path):
+            files, warnings = collect_midi_files(path)
+            for w in warnings:
+                print(f"Warning: {w}", file=sys.stderr)
+            if not files:
+                print(f"Warning: no MIDI files found in directory: {path}", file=sys.stderr)
+            expanded_paths.extend(files)
+        elif os.path.isfile(path):
+            expanded_paths.append(path)
+        else:
+            print(f"Error: path not found: {path}", file=sys.stderr)
+            any_error = True
+
+    for i, filepath in enumerate(expanded_paths):
         if i > 0 and not args.json:
             print()
         try:
