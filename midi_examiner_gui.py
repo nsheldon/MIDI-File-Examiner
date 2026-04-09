@@ -495,8 +495,14 @@ class ServiceAwareTextEdit(QTextEdit):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        # Defer swizzle until the native NSView exists (after show)
-        QTimer.singleShot(0, lambda: _register_view_for_services(self))
+        self._services_registered = False
+
+    def showEvent(self, event):
+        """Register for macOS Services on first show, when the native NSView exists."""
+        super().showEvent(event)
+        if not self._services_registered:
+            self._services_registered = True
+            _register_view_for_services(self)
 
     def contextMenuEvent(self, event):
         menu = self.createStandardContextMenu()
@@ -710,7 +716,7 @@ class MidiApplication(QApplication):
     def set_window(self, window):
         self._window = window
         if self._pending_file:
-            window.analyze(self._pending_file)
+            window.analyze(self._pending_file, sorted_insert=True)
             self._pending_file = None
 
     def event(self, e):
@@ -718,7 +724,7 @@ class MidiApplication(QApplication):
             path = e.file()
             if path:
                 if self._window:
-                    self._window.analyze(path)
+                    self._window.analyze(path, sorted_insert=True)
                 else:
                     self._pending_file = path
             return True
@@ -841,7 +847,7 @@ class MidiExaminerWindow(QMainWindow):
             "MIDI Files (*.mid *.midi);;All Files (*)",
         )
         for path in paths:
-            self.analyze(path)
+            self.analyze(path, sorted_insert=True)
 
     def open_folder_dialog(self):
         folder = QFileDialog.getExistingDirectory(
@@ -857,6 +863,8 @@ class MidiExaminerWindow(QMainWindow):
 
         Directories are scanned recursively up to 3 levels deep.  If any files
         were excluded due to the depth limit a warning dialog is shown.
+        Directory scans show folder-name headers in the sidebar to mirror the
+        filesystem hierarchy.
         """
         from PyQt6.QtWidgets import QMessageBox
         # Opening a folder replaces the current list rather than appending to it.
@@ -869,12 +877,20 @@ class MidiExaminerWindow(QMainWindow):
                 all_warnings.extend(warnings)
                 if not files:
                     all_warnings.append(f"No MIDI files found in: {os.path.basename(path)}")
+                seen_folders = set()
                 for f in files:
                     rel = os.path.relpath(f, path)
-                    depth = len(rel.split(os.sep)) - 1
-                    self.analyze(f, depth=depth)
+                    parts = rel.split(os.sep)
+                    folder_parts = parts[:-1]
+                    # Insert a folder header for each new subfolder level.
+                    for i in range(len(folder_parts)):
+                        folder_key = os.sep.join(folder_parts[:i + 1])
+                        if folder_key not in seen_folders:
+                            seen_folders.add(folder_key)
+                            self._add_folder_header(folder_parts[i], depth=i)
+                    self.analyze(f, depth=len(folder_parts))
             else:
-                self.analyze(path)
+                self.analyze(path, sorted_insert=True)
         if all_warnings:
             QMessageBox.warning(
                 self,
@@ -882,19 +898,29 @@ class MidiExaminerWindow(QMainWindow):
                 "\n".join(all_warnings),
             )
 
+    def _add_folder_header(self, name, depth=0):
+        """Insert a non-selectable bold folder-name item into the sidebar."""
+        indent = "\u00A0\u00A0\u00A0\u00A0" * depth
+        item = QListWidgetItem(f"{indent}{name}/")
+        item.setFlags(Qt.ItemFlag.ItemIsEnabled)   # visible but not selectable
+        font = item.font()
+        font.setBold(True)
+        item.setFont(font)
+        self.sidebar.addItem(item)
+
     @staticmethod
     def _sidebar_label(name, depth):
         """Build a display label that visually indents *name* by *depth* levels.
 
         Depth 0 (root or individually opened file) has no prefix.
-        Each level adds two non-breaking spaces plus a › indicator.
+        Each level adds four non-breaking spaces of indentation.
         """
         if depth <= 0:
             return name
-        indent = "\u00A0\u00A0" * depth  # non-breaking spaces so Qt won't collapse them
-        return f"{indent}›\u00A0{name}"
+        indent = "\u00A0\u00A0\u00A0\u00A0" * depth  # non-breaking spaces so Qt won't collapse them
+        return f"{indent}{name}"
 
-    def analyze(self, path, depth=0):
+    def analyze(self, path, depth=0, sorted_insert=False):
         # Already in the sidebar (analyzed or queued) — just select it.
         if path in self._file_sections or path in self._pending_paths \
                 or path == self._active_worker_path:
@@ -906,12 +932,33 @@ class MidiExaminerWindow(QMainWindow):
         item = QListWidgetItem(label)
         item.setData(Qt.ItemDataRole.UserRole, path)
         item.setData(Qt.ItemDataRole.UserRole.value + 1, label)  # base label (no tags)
-        self.sidebar.addItem(item)
+        if sorted_insert:
+            self._insert_file_sorted(item, path)
+        else:
+            self.sidebar.addItem(item)
         self.sidebar.setCurrentItem(item)
         self.clear_button.setEnabled(True)
 
         self._pending_paths.append(path)
         self._start_next_worker()
+
+    def _insert_file_sorted(self, item, path):
+        """Insert *item* into the sidebar in case-insensitive order by basename.
+
+        Only file items (those with a UserRole path) are considered for
+        ordering; folder-header items are skipped.  The new item is placed
+        before the first existing file item whose basename sorts after it.
+        """
+        key = os.path.basename(path).lower()
+        for i in range(self.sidebar.count()):
+            existing = self.sidebar.item(i)
+            existing_path = existing.data(Qt.ItemDataRole.UserRole)
+            if not existing_path:
+                continue  # folder header — skip
+            if key < os.path.basename(existing_path).lower():
+                self.sidebar.insertItem(i, item)
+                return
+        self.sidebar.addItem(item)
 
     def _clear_files(self):
         self._pending_paths.clear()
@@ -929,10 +976,16 @@ class MidiExaminerWindow(QMainWindow):
         path = self._pending_paths.pop(0)
         self._active_worker_path = path
         self.statusBar().showMessage(f"Analyzing: {os.path.basename(path)}")
-        self.worker = AnalysisWorker(path)
-        self.worker.finished.connect(self._on_analysis_done)
-        self.worker.error.connect(self._on_analysis_error)
-        self.worker.start()
+        worker = AnalysisWorker(path)
+        worker.finished.connect(self._on_analysis_done)
+        worker.error.connect(self._on_analysis_error)
+        # Schedule the old worker for deletion via Qt's event loop rather than
+        # relying on Python GC, which may run while the thread is still doing
+        # OS-level teardown after run() returns.
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(worker.deleteLater)
+        self.worker = worker
+        worker.start()
 
     def _on_analysis_done(self, text, standard, has_warnings, assumed, is_karaoke):
         path = self._active_worker_path
@@ -988,6 +1041,8 @@ class MidiExaminerWindow(QMainWindow):
         if current is None:
             return
         path = current.data(Qt.ItemDataRole.UserRole)
+        if not path:  # folder header items have no UserRole data
+            return
         self.file_path_edit.setText(path)
         if path in self._file_sections:
             self._populate_tabs(path)

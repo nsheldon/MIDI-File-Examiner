@@ -17,7 +17,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 # ── Terminal colour support ───────────────────────────────────────────────────
 
@@ -132,8 +132,13 @@ def _scan_directory(root, max_depth=3):
 
         midi_here = [f for f in filenames if f.lower().endswith(('.mid', '.midi'))]
 
+        # Sort subdirectory names in-place (controls os.walk traversal order)
+        # and MIDI filenames case-insensitively so the sidebar hierarchy is
+        # presented in alphabetical order regardless of letter case.
+        dirnames.sort(key=str.lower)
+
         if depth <= max_depth:
-            for name in sorted(midi_here):
+            for name in sorted(midi_here, key=str.lower):
                 included.append(os.path.join(dirpath, name))
         else:
             excluded_count += len(midi_here)
@@ -546,12 +551,38 @@ def determine_minimum_sc_version(results):
     }
 
 
+def _decoded_has_japanese(s):
+    """Return True if *s* contains characters from definitively Japanese Unicode blocks.
+
+    Checks for hiragana, full-width katakana, and CJK ideographs.  Half-width
+    katakana (U+FF61–U+FF9F) is intentionally excluded: those code points
+    overlap with Latin-1 special characters (e.g. U+00A9 © decodes as U+FF69 ｩ
+    in CP932), so treating them as proof of Japanese encoding causes false
+    positives on Western strings that use Latin-1 symbols.
+    """
+    for ch in s:
+        cp = ord(ch)
+        if (0x3040 <= cp <= 0x30FF or   # Hiragana + full-width Katakana
+                0x31F0 <= cp <= 0x31FF or   # Katakana Phonetic Extensions
+                0x3400 <= cp <= 0x4DBF or   # CJK Extension A
+                0x4E00 <= cp <= 0x9FFF or   # CJK Unified Ideographs
+                0xF900 <= cp <= 0xFAFF or   # CJK Compatibility Ideographs
+                0xFF01 <= cp <= 0xFF60 or   # Full-width Latin / punctuation
+                0xFFE0 <= cp <= 0xFFE6):    # Full-width currency / signs
+            return True
+    return False
+
+
 def decode_midi_text(text):
     """Decode a MIDI meta-message text string to properly-encoded Unicode.
 
     mido decodes all meta-message text as Latin-1.  Re-encode to the original
     bytes, then try encodings in order: pure ASCII (if no high bytes), UTF-8,
     CP932 (Windows Shift-JIS, common in Japanese MIDI files), EUC-JP.
+    For Japanese encodings, the decoded result must contain at least one
+    character from a definitively Japanese Unicode block; otherwise the bytes
+    are treated as Latin-1 (e.g. © is 0xA9 in Latin-1 but decodes to the
+    half-width katakana ｩ in CP932 — a false positive).
     Falls back to the original Latin-1 string if nothing else works.
     """
     try:
@@ -565,16 +596,25 @@ def decode_midi_text(text):
 
     for encoding in ('utf-8', 'cp932', 'euc-jp'):
         try:
-            return raw.decode(encoding)
+            decoded = raw.decode(encoding)
         except (UnicodeDecodeError, LookupError):
             continue
+        # For Japanese encodings, require at least one definitively Japanese
+        # character so that Latin-1 strings with high bytes (©, ®, °, etc.)
+        # are not misidentified as Japanese text.
+        if encoding in ('cp932', 'euc-jp') and not _decoded_has_japanese(decoded):
+            continue
+        return decoded
 
     # Lenient retry: tolerate truncated multibyte sequences (e.g. an incomplete
     # Shift-JIS lead byte at the end of a fixed-width track-name field).
-    for encoding in ('cp932', 'euc-jp', 'utf-8'):
+    # Only Japanese encodings are retried leniently; UTF-8 is not included
+    # because errors='ignore' would silently drop valid Latin-1 high bytes
+    # (e.g. 0xA9 © → empty) before the Latin-1 fallback is reached.
+    for encoding in ('cp932', 'euc-jp'):
         try:
             decoded = raw.decode(encoding, errors='ignore')
-            if decoded.strip():
+            if decoded.strip() and _decoded_has_japanese(decoded):
                 return decoded
         except LookupError:
             continue
@@ -583,15 +623,21 @@ def decode_midi_text(text):
 
 
 def _trim_track_garbage(filepath):
-    """Return a BytesIO of the MIDI file with any bytes after each track's End
-    of Track meta event removed.
+    """Return a BytesIO of the MIDI file with track-chunk anomalies fixed.
 
-    Some files (e.g. 7th Guest) store one or more padding bytes after the
-    mandatory FF 2F 00 End of Track marker.  mido reads past the EOT, tries to
-    consume another delta-time byte, and raises EOFError.  Stripping the
-    trailing bytes lets mido parse the file cleanly.
+    Handles two known corruption patterns:
 
-    Returns None if the file does not need trimming or cannot be patched.
+    1. Trailing bytes after EOT (e.g. 7th Guest): bytes beyond the mandatory
+       FF 2F 00 End of Track marker are stripped and the chunk length is
+       patched.
+
+    2. Truncated track chunks (e.g. Doom E3M5): if a track's declared length
+       extends past the end of the file, the available bytes are searched for
+       an EOT.  If one is found it is used as the track's end.  If not, the
+       track (and all subsequent tracks) is dropped and the MThd track-count
+       field is patched down accordingly.
+
+    Returns None if the file does not need patching or cannot be read.
     """
     _EOT = b'\xff\x2f\x00'
     try:
@@ -606,33 +652,51 @@ def _trim_track_garbage(filepath):
     hdr_len = int.from_bytes(data[4:8], 'big')
     pos = 8 + hdr_len
     trimmed = False
+    tracks_seen = 0  # count of tracks fully (or usefully partially) parsed
 
     while pos + 8 <= len(data):
         if data[pos:pos+4] != b'MTrk':
             break
-        declared = int.from_bytes(data[pos+4:pos+8], 'big')
+        declared   = int.from_bytes(data[pos+4:pos+8], 'big')
         track_start = pos + 8
         track_end   = track_start + declared
+
         if track_end > len(data):
+            # --- Truncated track: fewer bytes in the file than declared ---
+            available = len(data) - track_start
+            chunk = bytes(data[track_start:track_start + available])
+            eot_idx = chunk.rfind(_EOT)
+            if eot_idx != -1:
+                # Usable partial track: trim at EOT
+                proper_end = eot_idx + len(_EOT)
+                new_declared = proper_end
+                data[pos+4:pos+8] = new_declared.to_bytes(4, 'big')
+                data = data[:track_start + new_declared]
+                tracks_seen += 1
+            else:
+                # No EOT anywhere in the available data — drop this track
+                # and everything after it.
+                data = data[:pos]
+            # Either way, patch the MThd track count and stop processing.
+            data[10:12] = tracks_seen.to_bytes(2, 'big')
+            trimmed = True
             break
 
-        # Find the last EOT in this chunk
+        # --- Full track available: look for trailing garbage after EOT ---
         chunk = data[track_start:track_end]
         eot_idx = chunk.rfind(_EOT)
         if eot_idx != -1:
             proper_end = eot_idx + len(_EOT)
             if proper_end < len(chunk):
                 # Trailing bytes present — trim the chunk
-                new_chunk = chunk[:proper_end]
-                new_declared = len(new_chunk)
+                new_declared = proper_end
                 data[pos+4:pos+8] = new_declared.to_bytes(4, 'big')
-                data[track_start:track_end] = new_chunk
-                # Adjust subsequent offsets by recalculating the slice
                 data = (data[:track_start + new_declared]
                         + data[track_end:])
                 track_end = track_start + new_declared
                 trimmed = True
 
+        tracks_seen += 1
         pos = track_end
 
     return io.BytesIO(bytes(data)) if trimmed else None
@@ -709,10 +773,12 @@ def _compute_length(mid):
 def _load_midi(filepath):
     """Load a MIDI file, retrying with workarounds for known mido parse errors.
 
-    Returns (mid, clipped, smpte_fallback, trim_fallback) where clipped
-    indicates note values were clamped, smpte_fallback indicates an invalid
-    SMPTE frame-rate code was ignored, and trim_fallback indicates trailing
-    bytes after an End of Track marker were stripped.
+    Returns (mid, clipped, smpte_fallback, trim_fallback, key_sig_fallback):
+      clipped         — note/data bytes were clamped to valid range
+      smpte_fallback  — unrecognised SMPTE frame-rate code was defaulted to 24 fps
+      trim_fallback   — trailing/missing track chunk bytes were patched or dropped
+      key_sig_fallback— invalid key signature mode byte was replaced with 'major'
+
     Raises IOError with a descriptive message if the file cannot be read.
     """
     import mido.midifiles.meta as _meta
@@ -741,6 +807,28 @@ def _load_midi(filepath):
         finally:
             _meta.MetaSpec_smpte_offset.decode = orig_decode
 
+    def _try_load_key_sig_tolerant(clip):
+        # Some files contain key signature meta events (0xFF 0x59) with an
+        # invalid mode byte (e.g. 0xFF = 255 instead of 0 = major / 1 = minor).
+        # Patch the decode method to fall back gracefully rather than raising
+        # KeySignatureError.
+        orig_decode = _meta.MetaSpec_key_signature.decode
+
+        def _lenient_decode(self, message, data):
+            key  = _meta.signed('byte', data[0])
+            mode = data[1]
+            try:
+                message.key = _meta._key_signature_decode[(key, mode)]
+            except KeyError:
+                # Try the same key count as major; then fall back to C major.
+                message.key = _meta._key_signature_decode.get((key, 0), 'C')
+
+        _meta.MetaSpec_key_signature.decode = _lenient_decode
+        try:
+            return mido.MidiFile(filepath, clip=clip)
+        finally:
+            _meta.MetaSpec_key_signature.decode = orig_decode
+
     def _try_load_trimmed(clip):
         # Some files have padding bytes after the End of Track marker inside
         # one or more track chunks, which causes mido to raise EOFError.
@@ -752,17 +840,23 @@ def _load_midi(filepath):
 
     for clip in (False, True):
         try:
-            return _try_load(clip), clip, False, False
+            return _try_load(clip), clip, False, False, False
         except EOFError:
             # Likely trailing garbage after an End of Track marker.
             try:
-                return _try_load_trimmed(clip), clip, False, True
+                return _try_load_trimmed(clip), clip, False, True, False
             except Exception:
                 pass
         except KeyError:
             # Likely an unrecognised SMPTE frame-rate code — retry with patch.
             try:
-                return _try_load_smpte_tolerant(clip), clip, True, False
+                return _try_load_smpte_tolerant(clip), clip, True, False, False
+            except Exception:
+                pass
+        except _meta.KeySignatureError:
+            # Invalid key signature mode byte — retry with lenient decoder.
+            try:
+                return _try_load_key_sig_tolerant(clip), clip, False, False, True
             except Exception:
                 pass
         except Exception:
@@ -778,7 +872,7 @@ def _load_midi(filepath):
 
 def analyze_midi_file(filepath):
     """Analyze a MIDI file and return structured data."""
-    mid, clipped, smpte_fallback, trim_fallback = _load_midi(filepath)
+    mid, clipped, smpte_fallback, trim_fallback, key_sig_fallback = _load_midi(filepath)
 
     results = {
         "file_info": {},
@@ -805,8 +899,14 @@ def analyze_midi_file(filepath):
         )
     if trim_fallback:
         results["warnings"].append(
-            "File contains trailing bytes after an End of Track marker in one or more track "
-            "chunks; the extra bytes were ignored during parsing."
+            "File contains malformed track chunk data (trailing bytes after an End of Track "
+            "marker, or one or more truncated/missing tracks); the affected data was patched "
+            "or dropped during parsing."
+        )
+    if key_sig_fallback:
+        results["warnings"].append(
+            "File contains a key signature meta event (0xFF 0x59) with an invalid mode byte; "
+            "the mode was replaced with 'major' during parsing."
         )
 
     length_secs, delta_capped = _compute_length(mid)
@@ -1124,12 +1224,15 @@ def analyze_midi_file(filepath):
     results["standard_upgrade_reason"] = standard_upgrade_reason
 
     # Detect Soft Karaoke (KAR) format: look for the canonical @KMIDI marker
-    # in text events.  Collect @V version, @T titles, @L language, @I info.
-    # The marker may have a trailing suffix (e.g. "tm"), so use startswith.
+    # in text events.  Collect @V version, @T titles, @L language, @I info,
+    # @K keywords, @W warnings.  The marker may have a trailing suffix (e.g.
+    # "tm"), so use startswith.  @KMIDI must be checked before @K.
     kar_version = None
     kar_titles = []
     kar_languages = []
     kar_info = []
+    kar_keywords = []
+    kar_warnings = []
     is_karaoke = False
     for evt in results["text_events"]:
         t = evt["text"].strip()
@@ -1143,20 +1246,28 @@ def analyze_midi_file(filepath):
             kar_languages.append(t[2:].strip())
         elif t.startswith("@I"):
             kar_info.append(t[2:].strip())
+        elif t.startswith("@K"):
+            kar_keywords.append(t[2:].strip())
+        elif t.startswith("@W"):
+            kar_warnings.append(t[2:].strip())
     results["karaoke"] = {
         "is_karaoke": is_karaoke,
         "version": kar_version,
         "titles": kar_titles,
         "languages": kar_languages,
         "info": kar_info,
+        "keywords": kar_keywords,
+        "warnings": kar_warnings,
     } if is_karaoke else None
 
     # Post-process program changes: fix cases where a bank select arrived
     # AFTER the program change on the same channel.  Some files send the
-    # program change first, then CC0/CC32.  Only apply the bank retroactively
-    # if NO note-on events on that channel occurred between the program change
-    # and the bank select — if notes were played first, the bank select is a
-    # new instrument selection, not a correction to the earlier program change.
+    # program change first, then CC0/CC32.  This includes the same-tick case
+    # where bank selects share the exact abs_time as the program change but
+    # appear later in the byte stream.  Only apply the bank retroactively if
+    # NO note-on events on that channel occurred between the program change and
+    # the bank select — if notes were played first, the bank select is a new
+    # instrument selection, not a correction to the earlier program change.
 
     # Build per-channel bank-select timeline: sorted list of
     # (abs_time, running_msb, running_lsb) after each MSB or LSB event.
@@ -1181,16 +1292,19 @@ def analyze_midi_file(filepath):
         if ch not in channel_bs_timeline:
             continue
         pc_time = pc["abs_time"]
-        # First bank select strictly after this program change
-        future = [(t, m, l) for (t, m, l) in channel_bs_timeline[ch] if t > pc_time]
+        # First bank select at or after this program change (same-tick bank
+        # selects that follow the PC in byte order are treated as paired).
+        future = [(t, m, l) for (t, m, l) in channel_bs_timeline[ch] if t >= pc_time]
         if not future:
             continue
         bs_time, new_msb, new_lsb = future[0]
         if new_msb == 0 and new_lsb == 0:
             continue
-        # If any note-on on this channel falls between the program change and
-        # the bank select, the bank select belongs to a new instrument selection.
-        if any(pc_time < t <= bs_time for t in channel_note_ons[ch]):
+        # If any note-on on this channel falls strictly between the program
+        # change and the bank select, the bank select belongs to a new
+        # instrument selection.  Same-tick note-ons are allowed (they fire
+        # simultaneously with the setup messages).
+        if any(pc_time < t < bs_time for t in channel_note_ons[ch]):
             continue
         pc["bank_msb"] = new_msb
         pc["bank_lsb"] = new_lsb
@@ -1732,6 +1846,12 @@ def print_results(results):
             print(f"  KAR Language:  {', '.join(kar['languages'])}")
         if kar["info"]:
             print(f"  KAR Info:      {'; '.join(kar['info'])}")
+        if kar.get("keywords"):
+            for kw in kar["keywords"]:
+                print(f"  KAR Keywords:  {kw}")
+        if kar.get("warnings"):
+            for w in kar["warnings"]:
+                print(f"  KAR Warning:   {w}")
 
     # Timing Information
     print_section("TIMING INFORMATION")
@@ -1783,7 +1903,12 @@ def print_results(results):
     if "copyright" in meta:
         print(f"  Copyright:     {sanitize_text(meta['copyright'])}")
     if "key_signature" in meta:
-        print(f"  Key Signature: {meta['key_signature']['key']}")
+        raw_key = meta['key_signature']['key']
+        if raw_key.endswith('m'):
+            display_key = f"{raw_key[:-1]} minor"
+        else:
+            display_key = f"{raw_key} major"
+        print(f"  Key Signature: {display_key}")
     if "instruments" in meta:
         print_subsection("Instrument Names")
         for inst in meta["instruments"]:
