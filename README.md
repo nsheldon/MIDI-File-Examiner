@@ -45,7 +45,7 @@ This generates **MIDI File Examiner.app** in the project folder. You can then:
 - **Double-click** the icon in Finder to launch it
 - **Drag it to the Dock** for quick access
 - **Drag a `.mid` or `.midi` file onto the Dock icon** to open it directly
-- **Double-click any `.mid`/`.midi` file** and choose *Open With → MIDI File Examiner* from the context menu
+- **Right-click (or Control-click) any `.mid`/`.midi` file** and choose *Open With → MIDI File Examiner* from the context menu
 
 The app automatically matches the macOS Light or Dark appearance and updates if you switch while it is running.
 
