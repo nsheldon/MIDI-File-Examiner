@@ -4,7 +4,7 @@ A tool for analyzing MIDI files, available as a macOS GUI app and a command-line
 
 ## Features
 
-- **macOS GUI app** with tabbed sections for each analysis category, drag-and-drop support for multiple files and folders, a colour-coded sidebar file list with depth indentation for directory scans, and automatic Light/Dark mode support
+- **macOS GUI app** with tabbed sections for each analysis category, drag-and-drop support for multiple files and folders, a color-coded sidebar file list with depth indentation for directory scans, and automatic Light/Dark mode support
 - Detects the MIDI standard in use (GM, GM2, GS, XG) via SysEx messages, assumes GM when files use only base GM banks or program changes, or reports Unknown when no standard evidence is present
 - Resolves program change numbers to instrument and drum kit names using an embedded patch database
 - For Roland GS files, identifies the minimum Sound Canvas version required (SC-55, SC-88, SC-88Pro, or SC-8850) and flags CM-64 PCM/LA patch usage
