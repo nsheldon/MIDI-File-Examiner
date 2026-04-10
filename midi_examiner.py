@@ -1393,6 +1393,59 @@ def analyze_midi_file(filepath):
                 pc["bank_msb"] = new_msb
                 pc["bank_lsb"] = new_lsb
 
+    # Synthesize derived program-change entries for mid-song bank changes.
+    # When a bank select arrives after notes have been played on a channel
+    # (i.e. it is not a setup-section message), and no subsequent PC follows
+    # to "claim" the new bank, the channel continues playing the same program
+    # under a different bank.  Insert a derived entry so the new bank
+    # configuration appears in the Program Changes output.
+    for ch, bs_list in channel_bs_timeline.items():
+        first_note = first_note_on_tick.get(ch, float('inf'))
+        ch_pcs = sorted(
+            [pc for pc in results["program_changes"] if pc["channel"] == ch],
+            key=lambda p: p["abs_time"]
+        )
+        if not ch_pcs:
+            continue
+        for bs_time, new_msb, new_lsb in bs_list:
+            # Only process bank changes that occur after the first note-on
+            # (setup-section BSes have already been paired with their PC).
+            if bs_time <= first_note:
+                continue
+            if new_msb == 0 and new_lsb == 0:
+                continue
+            # If a real PC follows this bank select, it already carries the
+            # new bank via channel_banks or the pairing logic — skip.
+            if any(pc["abs_time"] > bs_time for pc in ch_pcs):
+                continue
+            # Most recent PC at or before bs_time is the active program.
+            active_pc = None
+            for pc in ch_pcs:
+                if pc["abs_time"] <= bs_time:
+                    active_pc = pc
+            if active_pc is None:
+                continue
+            # Avoid a duplicate if this (program, bank) is already recorded.
+            if any(
+                pc["channel"] == ch
+                and pc["program"] == active_pc["program"]
+                and pc["bank_msb"] == new_msb
+                and pc["bank_lsb"] == new_lsb
+                for pc in results["program_changes"]
+            ):
+                continue
+            results["program_changes"].append({
+                "track":        active_pc["track"],
+                "channel":      ch,
+                "program":      active_pc["program"],
+                "program_name": None,   # filled by the re-resolution pass below
+                "bank_msb":     new_msb,
+                "bank_lsb":     new_lsb,
+                "is_percussion": active_pc["is_percussion"],
+                "abs_time":     bs_time,
+                "bank_change":  True,   # derived from a mid-song bank select
+            })
+
     # Re-resolve program names now that the final standard is known.
     # Names were looked up during the track loop when detected_standard may
     # have been None or GM; refresh them so every entry reflects the correct
@@ -2129,13 +2182,20 @@ def print_results(results):
             if any(pc["is_percussion"] for pc in changes):
                 channel_label += " (Percussion)"
             print(f"\n  {channel_label}:")
+            # Determine which program numbers appear with more than one bank
+            # configuration on this channel — those need explicit [Bank X:Y] even
+            # when the bank is 0:0.
+            bank_counts: dict = defaultdict(set)
+            for pc in changes:
+                bank_counts[pc["program"]].add((pc["bank_msb"], pc["bank_lsb"]))
+            multi_bank_programs = {pgm for pgm, banks in bank_counts.items() if len(banks) > 1}
             seen = set()
             for pc in changes:
                 key = (pc["program"], pc["bank_msb"], pc["bank_lsb"])
                 if key not in seen:
                     seen.add(key)
                     bank_info = ""
-                    if pc["bank_msb"] != 0 or pc["bank_lsb"] != 0:
+                    if pc["bank_msb"] != 0 or pc["bank_lsb"] != 0 or pc["program"] in multi_bank_programs:
                         bank_info = f" [Bank {pc['bank_msb']}:{pc['bank_lsb']}]"
                     assumed = " (assumed)" if pc.get("assumed") else ""
                     name = pc.get("program_name")
