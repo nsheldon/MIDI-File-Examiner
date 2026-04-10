@@ -1318,14 +1318,26 @@ def analyze_midi_file(filepath):
         "warnings": kar_warnings,
     } if is_karaoke else None
 
-    # Post-process program changes: fix cases where a bank select arrived
-    # AFTER the program change on the same channel.  Some files send the
-    # program change first, then CC0/CC32.  This includes the same-tick case
-    # where bank selects share the exact abs_time as the program change but
-    # appear later in the byte stream.  Only apply the bank retroactively if
-    # NO note-on events on that channel occurred between the program change and
-    # the bank select — if notes were played first, the bank select is a new
-    # instrument selection, not a correction to the earlier program change.
+    # Post-process program changes: pair bank selects with their program change
+    # when the two messages were not captured together by channel_banks.
+    #
+    # Two cases arise in practice:
+    #
+    # FORWARD (BS after PC in abs_time): some files send PC first then CC0/CC32,
+    # including the same-tick case where bank selects share the PC's abs_time
+    # but appear later in the byte stream.  Only apply the bank if:
+    #   - no note-on on the channel falls strictly between the PC and the BS
+    #     (a note between them means the BS is for a new instrument selection),
+    #   - AND the BS arrives no later than the first note-on on the channel
+    #     (a BS that appears after notes have been played is a mid-song bank
+    #     change; the PC should be treated as using bank 0:0).
+    #
+    # BACKWARD (BS before PC in abs_time): in Type 1 MIDI files, the track
+    # containing the BS may have a higher index than the track containing the
+    # PC, so the BS is parsed after the PC even though its abs_time is earlier.
+    # channel_banks therefore holds the wrong value when the PC is recorded.
+    # Apply the most recent qualifying BS that predates the PC, subject to
+    # the same "no notes strictly between BS and PC" guard.
 
     # Build per-channel bank-select timeline: sorted list of
     # (abs_time, running_msb, running_lsb) after each MSB or LSB event.
@@ -1343,6 +1355,12 @@ def analyze_midi_file(filepath):
                 cur_lsb = bs["value"]
             channel_bs_timeline[ch].append((bs["abs_time"], cur_msb, cur_lsb))
 
+    # Pre-compute the first note-on tick per channel (used as the "end of setup
+    # section" boundary for forward BS association).
+    first_note_on_tick = {
+        ch: min(times) for ch, times in channel_note_ons.items() if times
+    }
+
     for pc in results["program_changes"]:
         if pc["bank_msb"] != 0 or pc["bank_lsb"] != 0:
             continue
@@ -1350,22 +1368,30 @@ def analyze_midi_file(filepath):
         if ch not in channel_bs_timeline:
             continue
         pc_time = pc["abs_time"]
-        # First bank select at or after this program change (same-tick bank
-        # selects that follow the PC in byte order are treated as paired).
-        future = [(t, m, l) for (t, m, l) in channel_bs_timeline[ch] if t >= pc_time]
-        if not future:
-            continue
-        bs_time, new_msb, new_lsb = future[0]
-        if new_msb == 0 and new_lsb == 0:
-            continue
-        # If any note-on on this channel falls strictly between the program
-        # change and the bank select, the bank select belongs to a new
-        # instrument selection.  Same-tick note-ons are allowed (they fire
-        # simultaneously with the setup messages).
-        if any(pc_time < t < bs_time for t in channel_note_ons[ch]):
-            continue
-        pc["bank_msb"] = new_msb
-        pc["bank_lsb"] = new_lsb
+        first_note = first_note_on_tick.get(ch, float('inf'))
+
+        # --- Forward: first BS at or after the PC, before the first note-on ---
+        forward = [
+            (t, m, l) for (t, m, l) in channel_bs_timeline[ch]
+            if t >= pc_time and t <= first_note and (m != 0 or l != 0)
+        ]
+        if forward:
+            bs_time, new_msb, new_lsb = forward[0]
+            if not any(pc_time < t < bs_time for t in channel_note_ons[ch]):
+                pc["bank_msb"] = new_msb
+                pc["bank_lsb"] = new_lsb
+                continue
+
+        # --- Backward: most recent BS strictly before the PC, no notes between ---
+        backward = [
+            (t, m, l) for (t, m, l) in reversed(channel_bs_timeline[ch])
+            if t < pc_time and (m != 0 or l != 0)
+        ]
+        if backward:
+            bs_time, new_msb, new_lsb = backward[0]
+            if not any(bs_time < t < pc_time for t in channel_note_ons[ch]):
+                pc["bank_msb"] = new_msb
+                pc["bank_lsb"] = new_lsb
 
     # Re-resolve program names now that the final standard is known.
     # Names were looked up during the track loop when detected_standard may
