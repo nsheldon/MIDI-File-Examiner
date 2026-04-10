@@ -115,7 +115,7 @@ _CC_NAMES = {
 
 # ── Directory scanning ────────────────────────────────────────────────────────
 
-def _scan_directory(root, max_depth=3):
+def _scan_directory(root, max_depth=6):
     """Return (files, warnings) for all MIDI files in *root* up to *max_depth* levels deep.
 
     Depth is measured from *root* itself (depth 0).  Files directly inside
@@ -155,7 +155,7 @@ def _scan_directory(root, max_depth=3):
     return included, warnings
 
 
-def collect_midi_files(path, max_depth=3):
+def collect_midi_files(path, max_depth=6):
     """Collect MIDI file paths from *path* (a file or directory).
 
     If *path* is a MIDI file, returns ([path], []).

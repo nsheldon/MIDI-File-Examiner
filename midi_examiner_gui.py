@@ -15,7 +15,7 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget,
         QVBoxLayout, QHBoxLayout,
-        QPushButton, QLineEdit, QTextEdit, QFileDialog, QTabWidget, QMenu,
+        QPushButton, QLabel, QLineEdit, QTextEdit, QFileDialog, QTabWidget, QMenu,
         QListWidget, QListWidgetItem, QSplitter,
     )
     from PyQt6.QtGui import (QFont, QKeySequence, QAction,
@@ -826,6 +826,13 @@ class MidiExaminerWindow(QMainWindow):
         self.sidebar.currentItemChanged.connect(self._on_sidebar_selection_changed)
         sidebar_layout.addWidget(self.sidebar)
 
+        self.sidebar_status_label = QLabel("")
+        self.sidebar_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        font = self.sidebar_status_label.font()
+        font.setPointSize(font.pointSize() - 1)
+        self.sidebar_status_label.setFont(font)
+        sidebar_layout.addWidget(self.sidebar_status_label)
+
         self.clear_button = QPushButton("Clear")
         self.clear_button.setEnabled(False)
         self.clear_button.clicked.connect(self._clear_files)
@@ -870,7 +877,7 @@ class MidiExaminerWindow(QMainWindow):
     def _open_paths(self, paths):
         """Expand a list of file/directory paths and queue each MIDI file for analysis.
 
-        Directories are scanned recursively up to 3 levels deep.  If any files
+        Directories are scanned recursively up to 6 levels deep.  If any files
         were excluded due to the depth limit a warning dialog is shown.
         Directory scans show folder-name headers in the sidebar to mirror the
         filesystem hierarchy.
@@ -882,7 +889,7 @@ class MidiExaminerWindow(QMainWindow):
         all_warnings = []
         for path in paths:
             if os.path.isdir(path):
-                files, warnings = collect_midi_files(path)
+                files, warnings = collect_midi_files(path, max_depth=6)
                 all_warnings.extend(warnings)
                 if not files:
                     all_warnings.append(f"No MIDI files found in: {os.path.basename(path)}")
@@ -923,6 +930,7 @@ class MidiExaminerWindow(QMainWindow):
         font.setBold(True)
         item.setFont(font)
         self.sidebar.addItem(item)
+        self._update_sidebar_status()
 
     @staticmethod
     def _sidebar_label(name, depth):
@@ -956,6 +964,7 @@ class MidiExaminerWindow(QMainWindow):
         if select:
             self.sidebar.setCurrentItem(item)
         self.clear_button.setEnabled(True)
+        self._update_sidebar_status()
 
         self._pending_paths.append(path)
         self._pending_set.add(path)
@@ -979,6 +988,24 @@ class MidiExaminerWindow(QMainWindow):
                 return
         self.sidebar.addItem(item)
 
+    def _update_sidebar_status(self):
+        """Refresh the file/folder count label below the sidebar."""
+        files = len(self._file_order)
+        # Count folder-header items (those with no UserRole path).
+        folders = sum(
+            1 for i in range(self.sidebar.count())
+            if not self.sidebar.item(i).data(Qt.ItemDataRole.UserRole)
+        )
+        if files == 0 and folders == 0:
+            self.sidebar_status_label.setText("")
+        elif folders == 0:
+            self.sidebar_status_label.setText(f"{files} file{'s' if files != 1 else ''}")
+        else:
+            self.sidebar_status_label.setText(
+                f"{files} file{'s' if files != 1 else ''}  ·  "
+                f"{folders} folder{'s' if folders != 1 else ''}"
+            )
+
     def _clear_files(self):
         self._pending_paths.clear()
         self._pending_set.clear()
@@ -989,6 +1016,7 @@ class MidiExaminerWindow(QMainWindow):
         self.tab_widget.clear()
         self.file_path_edit.clear()
         self.clear_button.setEnabled(False)
+        self.sidebar_status_label.setText("")
         self.statusBar().showMessage("Ready — open a MIDI file to begin.")
 
     def _start_next_worker(self):
