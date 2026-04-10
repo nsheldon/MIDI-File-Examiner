@@ -17,7 +17,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 
 # ── Terminal colour support ───────────────────────────────────────────────────
 
@@ -554,8 +554,9 @@ def determine_minimum_sc_version(results):
 _MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB — refuse files larger than this
 
 
-def _decoded_has_japanese(s):
-    """Return True if *s* contains characters from definitively Japanese Unicode blocks.
+def _decoded_has_japanese(s, min_count=1):
+    """Return True if *s* contains at least *min_count* characters from
+    definitively Japanese Unicode blocks.
 
     Checks for hiragana, full-width katakana, and CJK ideographs.  Half-width
     katakana (U+FF61–U+FF9F) is intentionally excluded: those code points
@@ -563,6 +564,7 @@ def _decoded_has_japanese(s):
     in CP932), so treating them as proof of Japanese encoding causes false
     positives on Western strings that use Latin-1 symbols.
     """
+    count = 0
     for ch in s:
         cp = ord(ch)
         if (0x3040 <= cp <= 0x30FF or   # Hiragana + full-width Katakana
@@ -572,7 +574,9 @@ def _decoded_has_japanese(s):
                 0xF900 <= cp <= 0xFAFF or   # CJK Compatibility Ideographs
                 0xFF01 <= cp <= 0xFF60 or   # Full-width Latin / punctuation
                 0xFFE0 <= cp <= 0xFFE6):    # Full-width currency / signs
-            return True
+            count += 1
+            if count >= min_count:
+                return True
     return False
 
 
@@ -581,15 +585,17 @@ _SAFE_CTRL = {0x09, 0x0A, 0x0D}
 
 
 def _sanitize_midi_text(s):
-    """Strip dangerous control characters from a decoded MIDI text string.
+    """Strip non-printable characters from a decoded MIDI text string.
 
-    Keeps printable characters, space, tab (0x09), LF (0x0A), and CR (0x0D).
-    Removes all other C0 controls (0x00–0x1F), DEL (0x7F), and ESC (0x1B)
-    which could be used to inject terminal escape sequences into CLI output.
+    Keeps printable ASCII (U+0020–U+007E), tab (U+0009), LF (U+000A),
+    CR (U+000D), and all non-control characters at U+00A0 and above.
+    Strips C0 controls (U+0000–U+001F, except tab/LF/CR), DEL (U+007F),
+    and C1 controls (U+0080–U+009F) which are non-printable in Unicode and
+    could be used to inject terminal escape sequences into CLI output.
     """
     return ''.join(
         ch for ch in s
-        if ord(ch) >= 0x20 or ord(ch) in _SAFE_CTRL
+        if ord(ch) in _SAFE_CTRL or (0x20 <= ord(ch) <= 0x7E) or ord(ch) >= 0xA0
     )
 
 
@@ -598,11 +604,14 @@ def decode_midi_text(text):
 
     mido decodes all meta-message text as Latin-1.  Re-encode to the original
     bytes, then try encodings in order: pure ASCII (if no high bytes), UTF-8,
-    CP932 (Windows Shift-JIS, common in Japanese MIDI files), EUC-JP.
-    For Japanese encodings, the decoded result must contain at least one
-    character from a definitively Japanese Unicode block; otherwise the bytes
-    are treated as Latin-1 (e.g. © is 0xA9 in Latin-1 but decodes to the
-    half-width katakana ｩ in CP932 — a false positive).
+    CP932 (Windows Shift-JIS, common in Japanese MIDI files), EUC-JP, CP437
+    (IBM PC OEM, common in DOS-era MIDI files).
+    For Japanese encodings, the decoded result must contain at least 2 characters
+    from a definitively Japanese Unicode block to guard against false positives
+    where a single high byte in a European-encoded string (e.g. CP437 0x89 = ë)
+    accidentally forms a valid CP932 two-byte sequence decoding to a CJK character.
+    Falls back to CP437 when Japanese decoding fails but the result contains
+    printable Latin Extended characters (accented European letters).
     Falls back to the original Latin-1 string if nothing else works.
     Control characters that could be used for terminal injection are stripped
     from the result.
@@ -621,12 +630,35 @@ def decode_midi_text(text):
             decoded = raw.decode(encoding)
         except (UnicodeDecodeError, LookupError):
             continue
-        # For Japanese encodings, require at least one definitively Japanese
-        # character so that Latin-1 strings with high bytes (©, ®, °, etc.)
-        # are not misidentified as Japanese text.
-        if encoding in ('cp932', 'euc-jp') and not _decoded_has_japanese(decoded):
-            continue
+        # For Japanese encodings, require definitively Japanese characters so
+        # that Latin-1 strings with high bytes (©, ®, °, etc.) are not
+        # misidentified as Japanese text.  CP932 requires at least 2 to avoid
+        # the case where a single European high byte (e.g. CP437 ë = 0x89)
+        # accidentally forms a CP932 pair with the adjacent ASCII byte.
+        if encoding in ('cp932', 'euc-jp'):
+            min_j = 2 if encoding == 'cp932' else 1
+            if not _decoded_has_japanese(decoded, min_j):
+                continue
         return _sanitize_midi_text(decoded)
+
+    # CP932/EUC-JP did not confidently identify Japanese text.  Try CP437
+    # (IBM PC OEM encoding, common in DOS-era MIDI files from the early 1990s)
+    # before the lenient Japanese retry.  Accept only when every non-ASCII
+    # character in the result is a printable Latin Extended character
+    # (U+00C0–U+024F: accented European letters such as ë, ü, ç, ñ) and no
+    # Japanese characters are present.
+    # Note: CP437 bytes 0x80–0x9F all map to Latin Extended characters, so
+    # this check naturally accepts DOS-encoded European text while rejecting
+    # strings whose high bytes produce Greek, box-drawing, or other non-Latin
+    # symbols (which indicates the bytes are more likely CP932 or Latin-1).
+    try:
+        decoded = raw.decode('cp437')
+        non_ascii = [ch for ch in decoded if ord(ch) > 0x7E]
+        if (non_ascii and not _decoded_has_japanese(decoded) and
+                all(0x00C0 <= ord(ch) <= 0x024F for ch in non_ascii)):
+            return _sanitize_midi_text(decoded)
+    except LookupError:
+        pass
 
     # Lenient retry: tolerate truncated multibyte sequences (e.g. an incomplete
     # Shift-JIS lead byte at the end of a fixed-width track-name field).
@@ -636,7 +668,8 @@ def decode_midi_text(text):
     for encoding in ('cp932', 'euc-jp'):
         try:
             decoded = raw.decode(encoding, errors='ignore')
-            if decoded.strip() and _decoded_has_japanese(decoded):
+            min_j = 2 if encoding == 'cp932' else 1
+            if decoded.strip() and _decoded_has_japanese(decoded, min_j):
                 return _sanitize_midi_text(decoded)
         except LookupError:
             continue
