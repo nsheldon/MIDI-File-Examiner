@@ -1,5 +1,12 @@
 # Changelog
 
+### 1.1.3
+- **Fix: GUI crash processing large folder drops:** Four changes eliminate an O(n²) main-thread starvation pattern that crashed the app ~15 seconds into batch-analyzing large collections: (1) sidebar item lookup replaced with an O(1) path→item dict; (2) `_pending_paths` replaced with a `deque` + `set` for O(1) pop and membership tests; (3) `setCurrentItem` suppressed for every file during bulk folder load (only the first file triggers a selection change); (4) `_svc_view_map` NSView pointer entries are now removed via `widget.destroyed` when a `ServiceAwareTextEdit` is destroyed, preventing stale pointer accumulation.
+- **Fix: sidebar status label re-introduced O(n²) crash:** The new file/folder count label below the sidebar was computing the folder count by scanning all sidebar items on every mutation. Replaced with a `_folder_count` integer counter maintained in `_add_folder_header` and `_clear_files`, making the update O(1).
+- **GUI: sidebar file/folder count label:** A small label between the sidebar list and the Clear button shows the number of files and folders currently loaded (e.g. `42 files  ·  7 folders`). Updates on every add/clear and uses correct singular/plural forms.
+- **Increased max folder scan depth: 3 → 6:** Directory scans (both CLI and GUI) now recurse up to 6 levels deep instead of 3.
+- **Fix: bank select / program change association logic:** Two improvements to the post-processing that pairs bank selects with program changes. (1) Forward association now requires the bank select to arrive before the first note-on on the channel, preventing a mid-song bank change from being incorrectly paired with an earlier program change when no notes happen to fall between them. (2) New backward association handles the case where a bank select appears earlier in absolute time than its program change but in a higher-numbered track (common in Type 1 MIDI files), causing it to be missed by the in-order `channel_banks` dict; the most recent qualifying bank select before the program change is now applied if no notes fall strictly between the two.
+
 ### 1.1.2
 - **File size limit:** Files larger than 5 MB are rejected before analysis begins, with a message showing the actual and maximum size.
 - **MIDI magic-byte validation:** Files that do not start with the `MThd` header are rejected immediately with a clear error, preventing non-MIDI content from reaching the parser.
