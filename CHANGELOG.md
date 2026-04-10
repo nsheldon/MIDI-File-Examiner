@@ -1,5 +1,10 @@
 # Changelog
 
+### 1.1.2
+- **File size limit:** Files larger than 5 MB are rejected before analysis begins, with a message showing the actual and maximum size.
+- **MIDI magic-byte validation:** Files that do not start with the `MThd` header are rejected immediately with a clear error, preventing non-MIDI content from reaching the parser.
+- **Control character sanitization:** All C0 control characters (0x00–0x1F) and DEL (0x7F) — including ESC — are stripped from decoded MIDI text fields (track names, lyrics, text events, markers, etc.), preventing crafted files from injecting terminal escape sequences into CLI output.
+
 ### 1.1.1
 - **Fix: Latin-1 symbols (©, ®, °, etc.) misidentified as Japanese text:** Track names and other MIDI text fields containing Latin-1 high-byte characters (e.g. `0xA9` = `©`) were being decoded as CP932 half-width katakana (e.g. `ｩ`). CP932/EUC-JP decoding is now only accepted when the result contains at least one character from a definitively Japanese Unicode block (hiragana, full-width katakana, or CJK ideographs); otherwise the text falls back to Latin-1.
 - **Fix: Bank Select messages appearing after Program Change not associated with the program:** Bank Select CC 0/32 messages that arrive at the same MIDI tick as — but later in byte order than — the corresponding Program Change are now correctly paired with that program. Previously only bank selects with a strictly later timestamp were retroactively applied.

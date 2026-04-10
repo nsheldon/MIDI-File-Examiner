@@ -17,7 +17,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 # ── Terminal colour support ───────────────────────────────────────────────────
 
@@ -551,6 +551,9 @@ def determine_minimum_sc_version(results):
     }
 
 
+_MAX_FILE_SIZE = 5 * 1024 * 1024  # 5 MB — refuse files larger than this
+
+
 def _decoded_has_japanese(s):
     """Return True if *s* contains characters from definitively Japanese Unicode blocks.
 
@@ -573,6 +576,23 @@ def _decoded_has_japanese(s):
     return False
 
 
+# Control characters that are safe to keep in displayed text (tab, LF, CR).
+_SAFE_CTRL = {0x09, 0x0A, 0x0D}
+
+
+def _sanitize_midi_text(s):
+    """Strip dangerous control characters from a decoded MIDI text string.
+
+    Keeps printable characters, space, tab (0x09), LF (0x0A), and CR (0x0D).
+    Removes all other C0 controls (0x00–0x1F), DEL (0x7F), and ESC (0x1B)
+    which could be used to inject terminal escape sequences into CLI output.
+    """
+    return ''.join(
+        ch for ch in s
+        if ord(ch) >= 0x20 or ord(ch) in _SAFE_CTRL
+    )
+
+
 def decode_midi_text(text):
     """Decode a MIDI meta-message text string to properly-encoded Unicode.
 
@@ -584,6 +604,8 @@ def decode_midi_text(text):
     are treated as Latin-1 (e.g. © is 0xA9 in Latin-1 but decodes to the
     half-width katakana ｩ in CP932 — a false positive).
     Falls back to the original Latin-1 string if nothing else works.
+    Control characters that could be used for terminal injection are stripped
+    from the result.
     """
     try:
         raw = text.encode('latin-1')
@@ -592,7 +614,7 @@ def decode_midi_text(text):
 
     # Pure ASCII — no re-encoding needed
     if all(b < 0x80 for b in raw):
-        return text
+        return _sanitize_midi_text(text)
 
     for encoding in ('utf-8', 'cp932', 'euc-jp'):
         try:
@@ -604,7 +626,7 @@ def decode_midi_text(text):
         # are not misidentified as Japanese text.
         if encoding in ('cp932', 'euc-jp') and not _decoded_has_japanese(decoded):
             continue
-        return decoded
+        return _sanitize_midi_text(decoded)
 
     # Lenient retry: tolerate truncated multibyte sequences (e.g. an incomplete
     # Shift-JIS lead byte at the end of a fixed-width track-name field).
@@ -615,11 +637,45 @@ def decode_midi_text(text):
         try:
             decoded = raw.decode(encoding, errors='ignore')
             if decoded.strip() and _decoded_has_japanese(decoded):
-                return decoded
+                return _sanitize_midi_text(decoded)
         except LookupError:
             continue
 
-    return text  # fall back to Latin-1 (original mido behaviour)
+    return _sanitize_midi_text(text)  # fall back to Latin-1 (original mido behaviour)
+
+
+def _validate_midi_input(filepath):
+    """Raise IOError if *filepath* fails basic safety checks.
+
+    Checks performed:
+    - File size must not exceed _MAX_FILE_SIZE (5 MB).
+    - File must begin with the MIDI header magic bytes 'MThd'.
+
+    Raises IOError with a descriptive message on failure.
+    """
+    try:
+        size = os.path.getsize(filepath)
+    except OSError as e:
+        raise IOError(f"Cannot read file: {e}") from e
+
+    if size > _MAX_FILE_SIZE:
+        mb = size / (1024 * 1024)
+        raise IOError(
+            f"File is too large to analyze ({mb:.1f} MB). "
+            f"Maximum supported size is {_MAX_FILE_SIZE // (1024 * 1024)} MB."
+        )
+
+    try:
+        with open(filepath, 'rb') as f:
+            magic = f.read(4)
+    except OSError as e:
+        raise IOError(f"Cannot read file: {e}") from e
+
+    if magic != b'MThd':
+        raise IOError(
+            "File does not appear to be a valid MIDI file "
+            "(missing 'MThd' header)."
+        )
 
 
 def _trim_track_garbage(filepath):
@@ -781,6 +837,8 @@ def _load_midi(filepath):
 
     Raises IOError with a descriptive message if the file cannot be read.
     """
+    _validate_midi_input(filepath)  # size and magic-byte checks
+
     import mido.midifiles.meta as _meta
 
     def _try_load(clip):
