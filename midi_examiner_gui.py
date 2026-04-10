@@ -749,6 +749,7 @@ class MidiExaminerWindow(QMainWindow):
         self._pending_paths = deque()  # analysis queue (FIFO)
         self._pending_set = set()      # O(1) membership test for _pending_paths
         self._sidebar_items = {}   # path -> QListWidgetItem (O(1) lookup)
+        self._folder_count = 0     # number of folder-header rows in the sidebar
         self._active_worker_path = None
 
         self._build_menu()
@@ -930,6 +931,7 @@ class MidiExaminerWindow(QMainWindow):
         font.setBold(True)
         item.setFont(font)
         self.sidebar.addItem(item)
+        self._folder_count += 1
         self._update_sidebar_status()
 
     @staticmethod
@@ -989,13 +991,13 @@ class MidiExaminerWindow(QMainWindow):
         self.sidebar.addItem(item)
 
     def _update_sidebar_status(self):
-        """Refresh the file/folder count label below the sidebar."""
+        """Refresh the file/folder count label below the sidebar.
+
+        Uses pre-maintained counters (_file_order length and _folder_count)
+        so this is O(1) and safe to call on every sidebar mutation.
+        """
         files = len(self._file_order)
-        # Count folder-header items (those with no UserRole path).
-        folders = sum(
-            1 for i in range(self.sidebar.count())
-            if not self.sidebar.item(i).data(Qt.ItemDataRole.UserRole)
-        )
+        folders = self._folder_count
         if files == 0 and folders == 0:
             self.sidebar_status_label.setText("")
         elif folders == 0:
@@ -1010,6 +1012,7 @@ class MidiExaminerWindow(QMainWindow):
         self._pending_paths.clear()
         self._pending_set.clear()
         self._sidebar_items.clear()
+        self._folder_count = 0
         self._file_sections.clear()
         self._file_order.clear()
         self.sidebar.clear()
