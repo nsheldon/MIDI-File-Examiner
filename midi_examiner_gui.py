@@ -9,6 +9,7 @@ import os
 import io
 import re
 import contextlib
+from collections import deque
 
 try:
     from PyQt6.QtWidgets import (
@@ -291,6 +292,12 @@ def _register_view_for_services(widget):
             return
         lib.object_setClass(ns_view, new_cls)
         _svc_view_map[ns_view] = _weakref.ref(widget)
+        # Remove the stale entry when the widget is destroyed so that the
+        # freed NSView pointer cannot linger as a dangling key in _svc_view_map.
+        # A dangling pointer in the map risks a crash if macOS calls our
+        # swizzled ObjC method on memory that has since been reallocated.
+        _ns = ns_view  # capture by value for the closure
+        widget.destroyed.connect(lambda _obj=None, _k=_ns: _svc_view_map.pop(_k, None))
     except Exception:
         pass
 
@@ -739,7 +746,9 @@ class MidiExaminerWindow(QMainWindow):
         self.worker = None
         self._file_sections = {}   # path -> [(label, content), ...]
         self._file_order = []      # paths in insertion order
-        self._pending_paths = []   # analysis queue
+        self._pending_paths = deque()  # analysis queue (FIFO)
+        self._pending_set = set()      # O(1) membership test for _pending_paths
+        self._sidebar_items = {}   # path -> QListWidgetItem (O(1) lookup)
         self._active_worker_path = None
 
         self._build_menu()
@@ -878,6 +887,7 @@ class MidiExaminerWindow(QMainWindow):
                 if not files:
                     all_warnings.append(f"No MIDI files found in: {os.path.basename(path)}")
                 seen_folders = set()
+                first_file = True
                 for f in files:
                     rel = os.path.relpath(f, path)
                     parts = rel.split(os.sep)
@@ -888,7 +898,13 @@ class MidiExaminerWindow(QMainWindow):
                         if folder_key not in seen_folders:
                             seen_folders.add(folder_key)
                             self._add_folder_header(folder_parts[i], depth=i)
-                    self.analyze(f, depth=len(folder_parts))
+                    # Only select the first file; adding thousands of items to the
+                    # sidebar one-by-one while changing the selection each time
+                    # fires currentItemChanged synchronously on the main thread for
+                    # every file, which can cause severe event-loop starvation on
+                    # large collections.
+                    self.analyze(f, depth=len(folder_parts), select=first_file)
+                    first_file = False
             else:
                 self.analyze(path, sorted_insert=True)
         if all_warnings:
@@ -920,9 +936,9 @@ class MidiExaminerWindow(QMainWindow):
         indent = "\u00A0\u00A0\u00A0\u00A0" * depth  # non-breaking spaces so Qt won't collapse them
         return f"{indent}{name}"
 
-    def analyze(self, path, depth=0, sorted_insert=False):
+    def analyze(self, path, depth=0, sorted_insert=False, select=True):
         # Already in the sidebar (analyzed or queued) — just select it.
-        if path in self._file_sections or path in self._pending_paths \
+        if path in self._file_sections or path in self._pending_set \
                 or path == self._active_worker_path:
             self._select_sidebar_item(path)
             return
@@ -936,10 +952,13 @@ class MidiExaminerWindow(QMainWindow):
             self._insert_file_sorted(item, path)
         else:
             self.sidebar.addItem(item)
-        self.sidebar.setCurrentItem(item)
+        self._sidebar_items[path] = item
+        if select:
+            self.sidebar.setCurrentItem(item)
         self.clear_button.setEnabled(True)
 
         self._pending_paths.append(path)
+        self._pending_set.add(path)
         self._start_next_worker()
 
     def _insert_file_sorted(self, item, path):
@@ -962,6 +981,8 @@ class MidiExaminerWindow(QMainWindow):
 
     def _clear_files(self):
         self._pending_paths.clear()
+        self._pending_set.clear()
+        self._sidebar_items.clear()
         self._file_sections.clear()
         self._file_order.clear()
         self.sidebar.clear()
@@ -973,7 +994,8 @@ class MidiExaminerWindow(QMainWindow):
     def _start_next_worker(self):
         if self._active_worker_path is not None or not self._pending_paths:
             return
-        path = self._pending_paths.pop(0)
+        path = self._pending_paths.popleft()
+        self._pending_set.discard(path)
         self._active_worker_path = path
         self.statusBar().showMessage(f"Analyzing: {os.path.basename(path)}")
         worker = AnalysisWorker(path)
@@ -995,12 +1017,10 @@ class MidiExaminerWindow(QMainWindow):
             self._start_next_worker()
             return
         self._file_sections[path] = _split_sections(text)
-        # Colour and tag the sidebar item for this file.
-        for i in range(self.sidebar.count()):
-            item = self.sidebar.item(i)
-            if item.data(Qt.ItemDataRole.UserRole) == path:
-                _apply_standard_style(item, standard, has_warnings, assumed, is_karaoke)
-                break
+        # Colour and tag the sidebar item for this file — O(1) via dict.
+        item = self._sidebar_items.get(path)
+        if item:
+            _apply_standard_style(item, standard, has_warnings, assumed, is_karaoke)
         current = self.sidebar.currentItem()
         if current and current.data(Qt.ItemDataRole.UserRole) == path:
             self._populate_tabs(path)
