@@ -4,7 +4,7 @@ A tool for analyzing MIDI files, available as a macOS GUI app and a command-line
 
 ## Features
 
-- **macOS GUI app** with tabbed sections for each analysis category, drag-and-drop support for multiple files and folders, a color-coded sidebar file list with depth indentation for directory scans, and automatic Light/Dark mode support
+- **macOS GUI app** with tabbed sections for each analysis category, drag-and-drop support for multiple files and folders, a color-coded sidebar file list with depth indentation for directory scans, a filter panel to show or hide files by standard and tag, and automatic Light/Dark mode support
 - Detects the MIDI standard in use (GM, GM2, GS, XG) via SysEx messages, assumes GM when files use only base GM banks or program changes, or reports Unknown when no standard evidence is present
 - Resolves program change numbers to instrument and drum kit names using an embedded patch database
 - For Roland GS files, identifies the minimum Sound Canvas version required (SC-55, SC-88, SC-88Pro, or SC-8850) and flags CM-64 PCM/LA patch usage
@@ -15,6 +15,7 @@ A tool for analyzing MIDI files, available as a macOS GUI app and a command-line
 - Reports tempo and time signature changes with measure/beat positions
 - Lists SysEx, bank select, program change, text, marker, cue point, and lyric events
 - Outputs results as human-readable text or JSON (command-line)
+- **Filtering:** filter results by MIDI standard, karaoke format, assumed-standard status, or warnings — both in the GUI sidebar and on the command line via `--filter` and `--exclude`
 
 ## Requirements
 
@@ -58,7 +59,12 @@ python3 midi_examiner_gui.py
 python3 midi_examiner_gui.py song.mid   # open a file directly on launch
 ```
 
-Drag and drop a `.mid` or `.midi` file onto the window to analyze it.
+Drag and drop `.mid` or `.midi` files and folders onto the window to analyze them.
+
+The **Filter** panel above the sidebar lets you narrow the file list without reloading:
+
+- **Standard checkboxes** (GM, GM2, GS, XG, Unknown) — check any combination to show files matching any of those standards (OR logic); leave all unchecked to show every standard.
+- **Modifier checkboxes** ([?], [!], KAR) — tri-state: one click = show only files with that tag; a second click = hide files with that tag (shown as –); a third click = off.
 
 ### Command Line
 
@@ -72,10 +78,32 @@ python midi_examiner.py --json <midi_file> > analysis.json
 
 | Option | Description |
 |--------|-------------|
-| `midi_file` | Path to the MIDI file to analyze |
+| `midi_file` | Path to the MIDI file(s) or folder(s) to analyze |
 | `-v`, `--verbose` | Show more detailed output |
 | `--json` | Output results as JSON instead of formatted text |
+| `--filter TAG` | Show only files matching this tag (repeatable). Standard tags — `GM`, `GM2`, `GS`, `XG`, `unknown` — are OR'd together; modifier tags — `KAR`, `assumed`, `warnings` — are AND'd. |
+| `--exclude TAG` | Hide files matching this tag (repeatable). Valid tags are the same as `--filter`. |
+| `--paths-only` | Print only matching file paths, one per line — useful for piping to other tools. Cannot be combined with `--json`. |
 | `--version` | Show the version number and exit |
+
+**Filter examples:**
+
+```bash
+# Show only GS files
+python midi_examiner.py --filter GS /path/to/folder/
+
+# Show GM or GS files (OR logic for standard tags)
+python midi_examiner.py --filter GM --filter GS /path/to/folder/
+
+# Show GS files that also have an assumed standard (AND logic for modifier tags)
+python midi_examiner.py --filter GS --filter assumed /path/to/folder/
+
+# Hide files with assumed standard or warnings
+python midi_examiner.py --exclude assumed --exclude warnings /path/to/folder/
+
+# Pipe matching paths to another tool
+python midi_examiner.py --filter GS --paths-only /path/to/folder/ | xargs some_tool
+```
 
 ## Example Output
 
