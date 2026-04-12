@@ -2393,8 +2393,18 @@ def get_percussion_name(bank_msb, bank_lsb, program, standard=None):
             result = cursor.fetchone()
             if result:
                 break
-        # Final GS fallback: SC-55 base kit (lsb=1) when no CC32 was sent
-        if not result:
+        # Final GS fallback: try all SC generations (lsb 1–4) when no CC32 was sent
+        # (bank_lsb=0 means no CC32; kits like "STANDARD 2" only exist at lsb≥2)
+        if not result and bank_lsb == 0:
+            for gen_lsb in range(1, 5):
+                cursor.execute("""
+                    SELECT name FROM percussion_sets
+                    WHERE standard = 'GS' AND bank_msb = ? AND bank_lsb = ? AND program = ?
+                """, (bank_msb, gen_lsb, program))
+                result = cursor.fetchone()
+                if result:
+                    break
+        elif not result:
             cursor.execute("""
                 SELECT name FROM percussion_sets
                 WHERE standard = 'GS' AND bank_msb = ? AND bank_lsb = 1 AND program = ?

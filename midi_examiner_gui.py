@@ -163,6 +163,9 @@ def _setup_services_menu():
 def _make_services_class(lib, base_class):
     """Build (once per base class) an ObjC subclass with NSServicesMenuRequestor."""
     import ctypes
+    # Guard: a null base_class would cause objc_allocateClassPair to crash.
+    if not base_class:
+        return None
     if base_class in _svc_class_cache:
         return _svc_class_cache[base_class]
 
@@ -285,9 +288,17 @@ def _register_view_for_services(widget):
         lib.object_setClass.restype  = ctypes.c_void_p
         lib.object_setClass.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 
-        ns_view    = int(widget.viewport().winId())
+        ns_view = int(widget.viewport().winId())
+        # Guard: winId() can return 0 if the native window hasn't been created
+        # yet or the widget is in a partially-initialised state.  Passing 0 to
+        # object_getClass / objc_allocateClassPair causes an immediate crash.
+        if not ns_view:
+            return
         base_class = lib.object_getClass(ns_view)
-        new_cls    = _make_services_class(lib, base_class)
+        # Guard: object_getClass can return NULL for non-ObjC objects.
+        if not base_class:
+            return
+        new_cls = _make_services_class(lib, base_class)
         if not new_cls:
             return
         lib.object_setClass(ns_view, new_cls)
@@ -1043,11 +1054,17 @@ class MidiExaminerWindow(QMainWindow):
     def _on_analysis_done(self, text, standard, has_warnings, assumed, is_karaoke):
         path = self._active_worker_path
         self._active_worker_path = None
-        if path not in self._file_order:
+        # Use _sidebar_items (O(1) dict) instead of _file_order (O(n) list) to
+        # check whether this file is still active.  Both are cleared together
+        # in _clear_files() and populated together in analyze().
+        if path not in self._sidebar_items:
             # File was cleared while the worker was running; discard result.
             self._start_next_worker()
             return
-        self._file_sections[path] = _split_sections(text)
+        # Store raw text; _split_sections() is deferred until the file is first
+        # viewed so that the main thread is not blocked parsing every file's
+        # output up-front during a large batch analysis.
+        self._file_sections[path] = text
         # Colour and tag the sidebar item for this file — O(1) via dict.
         item = self._sidebar_items.get(path)
         if item:
@@ -1061,7 +1078,7 @@ class MidiExaminerWindow(QMainWindow):
     def _on_analysis_error(self, message):
         path = self._active_worker_path
         self._active_worker_path = None
-        if path not in self._file_order:
+        if path not in self._sidebar_items:
             self._start_next_worker()
             return
         self._file_sections[path] = [("Error", f"Error: {message}")]
@@ -1073,7 +1090,15 @@ class MidiExaminerWindow(QMainWindow):
 
     def _populate_tabs(self, path):
         self.tab_widget.clear()
-        for label, content in self._file_sections.get(path, []):
+        raw = self._file_sections.get(path, [])
+        # Lazy parse: _on_analysis_done stores raw text (str) to avoid blocking
+        # the main thread for every file during batch analysis.  Parse here on
+        # first view and replace the stored value with the parsed list so
+        # subsequent views are free.
+        if isinstance(raw, str):
+            raw = _split_sections(raw)
+            self._file_sections[path] = raw
+        for label, content in raw:
             view = self._make_text_view()
             view.setPlainText(content)
             view.moveCursor(view.textCursor().MoveOperation.Start)

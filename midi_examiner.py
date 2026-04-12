@@ -17,7 +17,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.1.4"
+__version__ = "1.1.7"
 
 # ── Terminal colour support ───────────────────────────────────────────────────
 
@@ -1249,32 +1249,152 @@ def analyze_midi_file(filepath):
             else:
                 standard_assumed_reason = "no reset SysEx found; no bank selects detected"
         else:
-            # Build a human-readable reason. Non-zero MSBs are the primary
-            # indicator; only fall back to LSBs if all MSBs are zero.
-            bad_msbs = sorted({
+            # Non-zero bank selects without SysEx — try to identify GS or XG
+            # from bank select patterns before falling back to Unknown.
+
+            # Collect unique non-zero (channel, value) pairs for MSB and LSB.
+            nonzero_msbs = sorted({
                 (bs["channel"], bs["value"])
                 for bs in results["bank_selects"]
                 if bs["type"] == "MSB" and bs["value"] != 0
             })
-            if bad_msbs:
-                parts = [f"MSB {v} on channel {ch}" for ch, v in bad_msbs]
+            nonzero_lsbs = sorted({
+                (bs["channel"], bs["value"])
+                for bs in results["bank_selects"]
+                if bs["type"] == "LSB" and bs["value"] != 0
+            })
+
+            # XG-specific bank patterns (no overlap with GS):
+            #   MSB 64–69: special banks introduced in MU100 and later XG devices
+            #   LSB 64–96: SFX, SFX Kit, and other XG-only voice banks
+            xg_msb_ev = [(ch, v) for ch, v in nonzero_msbs if 64 <= v <= 69]
+            xg_lsb_ev = [(ch, v) for ch, v in nonzero_lsbs if 64 <= v <= 96]
+
+            # GS-specific bank patterns:
+            #   MSB 1–48: voice variation banks (capital tones, SC-55 through SC-8850)
+            #   LSB 1–4:  Sound Canvas generation capability markers
+            #             (1=SC-55, 2=SC-88, 3=SC-88Pro, 4=SC-8850) — only valid
+            #             when the PAIRED MSB is also in the GS range (0–48).
+            #             A LSB of 1–4 paired with an out-of-range MSB (e.g. 81
+            #             from a Roland XP-80) is a coincidence, not a GS marker.
+            #   MSB 126 or 127 on a melodic (non-percussion) channel:
+            #             CM-64 PCM (126) and CM-64 LA synthesis (127) banks
+            _GS_GEN = {1: "SC-55", 2: "SC-88", 3: "SC-88Pro", 4: "SC-8850"}
+            gs_msb_ev = [(ch, v) for ch, v in nonzero_msbs if 1 <= v <= 48]
+            # Use program_changes (which carry the paired bank_msb + bank_lsb) so
+            # we can confirm the LSB was paired with a GS-compatible MSB (0–48).
+            gs_lsb_ev = sorted({
+                (pc["channel"], pc["bank_lsb"])
+                for pc in results["program_changes"]
+                if 1 <= pc["bank_lsb"] <= 4 and pc["bank_msb"] <= 48
+            })
+            gs_cm64_ev = sorted({
+                (pc["channel"], pc["bank_msb"])
+                for pc in results["program_changes"]
+                if pc["bank_msb"] in (126, 127) and not pc["is_percussion"]
+            })
+
+            if xg_msb_ev or xg_lsb_ev:
+                # XG takes priority when XG-specific banks are present.
+                detected_standard = "XG"
+                standard_assumed = True
+                parts = []
+                for ch, v in xg_msb_ev:
+                    parts.append(f"Bank MSB {v} on channel {ch}")
+                for ch, v in xg_lsb_ev:
+                    parts.append(f"Bank LSB {v} on channel {ch}")
                 noun = "value" if len(parts) == 1 else "values"
-                standard_unknown_reason = (
-                    f"no SysEx detected; unrecognized bank {noun}: "
+                standard_assumed_reason = (
+                    f"no reset SysEx found; XG-specific bank {noun}: "
                     + ", ".join(parts)
                 )
+            elif gs_msb_ev or gs_lsb_ev or gs_cm64_ev:
+                # Before assuming GS, verify that all percussion channel data
+                # conforms to the GS standard: bank MSB must be 0, bank LSB
+                # must be 0–4, and the program must be a defined GS drum kit.
+                # Non-conforming percussion data disqualifies the file from
+                # assumed GS — a file targeting real GS hardware would not
+                # send invalid values on channel 10.
+                _gs_perc_violations = []
+                _conn_v = midi_patches_db.get_connection()
+                _cur_v = _conn_v.cursor()
+                for _pc in results["program_changes"]:
+                    if not _pc["is_percussion"]:
+                        continue
+                    if _pc["bank_msb"] != 0:
+                        _gs_perc_violations.append(
+                            f"Bank MSB {_pc['bank_msb']} on channel {_pc['channel']}"
+                        )
+                    elif not (0 <= _pc["bank_lsb"] <= 4):
+                        _gs_perc_violations.append(
+                            f"Bank LSB {_pc['bank_lsb']} on channel {_pc['channel']}"
+                        )
+                    else:
+                        _cur_v.execute(
+                            "SELECT 1 FROM percussion_sets"
+                            " WHERE standard='GS' AND program=? LIMIT 1",
+                            (_pc["program"],)
+                        )
+                        if not _cur_v.fetchone():
+                            _gs_perc_violations.append(
+                                f"PC {_pc['program']} on channel {_pc['channel']}"
+                            )
+                _conn_v.close()
+                # Deduplicate while preserving first-occurrence order
+                _gs_perc_violations = list(dict.fromkeys(_gs_perc_violations))
+
+                if not _gs_perc_violations:
+                    detected_standard = "GS"
+                    standard_assumed = True
+                    parts = []
+                    for ch, v in gs_msb_ev:
+                        parts.append(f"Bank MSB {v} on channel {ch}")
+                    for ch, v in gs_lsb_ev:
+                        gen = _GS_GEN.get(v, f"gen {v}")
+                        parts.append(f"Bank LSB {v} ({gen}) on channel {ch}")
+                    for ch, v in gs_cm64_ev:
+                        label = "CM-64 PCM" if v == 126 else "CM-64 LA"
+                        parts.append(f"Bank MSB {v} ({label}) on channel {ch}")
+                    noun = "value" if len(parts) == 1 else "values"
+                    standard_assumed_reason = (
+                        f"no reset SysEx found; GS-specific bank {noun}: "
+                        + ", ".join(parts)
+                    )
+                else:
+                    noun = "value" if len(_gs_perc_violations) == 1 else "values"
+                    standard_unknown_reason = (
+                        f"GS bank patterns present but non-GS percussion "
+                        f"{noun}: "
+                        + ", ".join(_gs_perc_violations)
+                    )
             else:
-                bad_lsbs = sorted({
+                # No GS/XG pattern recognised — report as Unknown.
+                # Non-zero MSBs are the primary indicator; only fall back to
+                # LSBs if all MSBs are zero.
+                bad_msbs = sorted({
                     (bs["channel"], bs["value"])
                     for bs in results["bank_selects"]
-                    if bs["type"] == "LSB" and bs["value"] != 0
+                    if bs["type"] == "MSB" and bs["value"] != 0
                 })
-                parts = [f"LSB {v} on channel {ch}" for ch, v in bad_lsbs]
-                noun = "value" if len(parts) == 1 else "values"
-                standard_unknown_reason = (
-                    f"no SysEx detected; non-standard bank {noun}: "
-                    + ", ".join(parts)
-                )
+                if bad_msbs:
+                    parts = [f"MSB {v} on channel {ch}" for ch, v in bad_msbs]
+                    noun = "value" if len(parts) == 1 else "values"
+                    standard_unknown_reason = (
+                        f"no SysEx detected; unrecognized bank {noun}: "
+                        + ", ".join(parts)
+                    )
+                else:
+                    bad_lsbs = sorted({
+                        (bs["channel"], bs["value"])
+                        for bs in results["bank_selects"]
+                        if bs["type"] == "LSB" and bs["value"] != 0
+                    })
+                    parts = [f"LSB {v} on channel {ch}" for ch, v in bad_lsbs]
+                    noun = "value" if len(parts) == 1 else "values"
+                    standard_unknown_reason = (
+                        f"no SysEx detected; non-standard bank {noun}: "
+                        + ", ".join(parts)
+                    )
 
     # If a GM Reset was detected, check whether the file actually targets GM2:
     # GM only defines program 0 on the percussion channel. Any other program
@@ -2222,13 +2342,23 @@ def print_results(results):
             for pc in changes:
                 bank_counts[pc["program"]].add((pc["bank_msb"], pc["bank_lsb"]))
             multi_bank_programs = {pgm for pgm, banks in bank_counts.items() if len(banks) > 1}
+            # If the channel itself switches between two or more distinct bank
+            # configurations, show [Bank X:Y] on every program change — including
+            # those at bank 0:0.  Without this, an explicit CC0=0 that resets the
+            # channel back to the base bank appears identical to "no bank select
+            # was ever sent", which can mislead readers into thinking the program
+            # inherited the previous non-zero bank.
+            channel_banks_used = {(pc["bank_msb"], pc["bank_lsb"]) for pc in changes}
+            channel_has_multiple_banks = len(channel_banks_used) > 1
             seen = set()
             for pc in changes:
                 key = (pc["program"], pc["bank_msb"], pc["bank_lsb"])
                 if key not in seen:
                     seen.add(key)
                     bank_info = ""
-                    if pc["bank_msb"] != 0 or pc["bank_lsb"] != 0 or pc["program"] in multi_bank_programs:
+                    if (pc["bank_msb"] != 0 or pc["bank_lsb"] != 0
+                            or pc["program"] in multi_bank_programs
+                            or channel_has_multiple_banks):
                         bank_info = f" [Bank {pc['bank_msb']}:{pc['bank_lsb']}]"
                     assumed = " (assumed)" if pc.get("assumed") else ""
                     name = pc.get("program_name")
