@@ -17,7 +17,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.1.7"
+__version__ = "1.2.0"
 
 # ── Terminal colour support ───────────────────────────────────────────────────
 
@@ -996,7 +996,7 @@ def analyze_midi_file(filepath):
         )
     if key_sig_fallback:
         results["warnings"].append(
-            "File contains a key signature meta event (0xFF 0x59) with an invalid mode byte; "
+            "File contains a key signature meta event with an invalid mode byte; "
             "the mode was replaced with 'major' during parsing."
         )
 
@@ -2375,6 +2375,71 @@ def print_results(results):
     print("=" * 60 + "\n")
 
 
+_VALID_FILTER_TAGS = frozenset(
+    {"gm", "gm2", "gs", "xg", "unknown", "kar", "assumed", "warnings"}
+)
+
+
+def _file_matches_filters(results, filters, excludes=()):
+    """Return True if *results* satisfies *filters* and is not excluded by *excludes*.
+
+    Standard tags in *filters* (GM/GM2/GS/XG/unknown) use OR logic: the file
+    must match at least one.  Modifier tags (KAR/assumed/warnings) use AND
+    logic.  Tags in *excludes* always hide a matching file regardless of
+    *filters*.  All elements must be lowercase strings from _VALID_FILTER_TAGS.
+    """
+    standard = (results.get("detected_standard") or "").upper()
+
+    # Standard filters: OR logic — file must match at least one selected standard.
+    standard_filters = [f for f in filters if f in ("gm", "gm2", "gs", "xg", "unknown")]
+    if standard_filters:
+        matched = False
+        for f in standard_filters:
+            if f == "unknown":
+                if not standard:
+                    matched = True
+                    break
+            elif standard == f.upper():
+                matched = True
+                break
+        if not matched:
+            return False
+
+    # Modifier filters: AND logic — file must have all listed modifier tags.
+    for f in filters:
+        if f in ("gm", "gm2", "gs", "xg", "unknown"):
+            continue  # handled above
+        if f == "kar":
+            if not results.get("karaoke"):
+                return False
+        elif f == "assumed":
+            if not results.get("standard_assumed"):
+                return False
+        elif f == "warnings":
+            if not results.get("warnings"):
+                return False
+
+    # Exclude filters: file must not match any excluded tag.
+    for f in excludes:
+        if f in ("gm", "gm2", "gs", "xg"):
+            if standard == f.upper():
+                return False
+        elif f == "unknown":
+            if not standard:
+                return False
+        elif f == "kar":
+            if results.get("karaoke"):
+                return False
+        elif f == "assumed":
+            if results.get("standard_assumed"):
+                return False
+        elif f == "warnings":
+            if results.get("warnings"):
+                return False
+
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MIDI File Examiner - Analyze MIDI files and display comprehensive information",
@@ -2385,6 +2450,11 @@ Examples:
   %(prog)s song1.mid song2.mid song3.mid
   %(prog)s -v song.mid
   %(prog)s --json song.mid > analysis.json
+  %(prog)s --filter GS /path/to/folder/
+  %(prog)s --filter GM --filter GS /path/to/folder/
+  %(prog)s --filter GS --filter assumed /path/to/folder/
+  %(prog)s --exclude assumed --exclude warnings /path/to/folder/
+  %(prog)s --filter GS --paths-only /path/to/folder/ | xargs some_tool
         """
     )
     parser.add_argument("midi_files", nargs='+',
@@ -2393,10 +2463,46 @@ Examples:
                         help="Show more detailed output")
     parser.add_argument("--json", action="store_true",
                         help="Output results as JSON")
+    parser.add_argument("--filter", dest="filters", action="append", metavar="TAG",
+                        help=("Show only files matching this tag (may be repeated). "
+                              "Standard tags (GM, GM2, GS, XG, unknown) are OR'd together; "
+                              "modifier tags (KAR, assumed, warnings) are AND'd. "
+                              "Valid tags: GM, GM2, GS, XG, unknown, KAR, assumed, warnings"))
+    parser.add_argument("--exclude", dest="excludes", action="append", metavar="TAG",
+                        help=("Hide files matching this tag (may be repeated). "
+                              "Valid tags: GM, GM2, GS, XG, unknown, KAR, assumed, warnings"))
+    parser.add_argument("--paths-only", action="store_true",
+                        help=("Print only matching file paths, one per line "
+                              "(useful for piping to other tools; cannot be combined with --json)"))
     parser.add_argument("--version", action="version",
                         version=f"%(prog)s {__version__}")
 
     args = parser.parse_args()
+
+    if args.paths_only and args.json:
+        print("Error: --paths-only and --json cannot be used together", file=sys.stderr)
+        sys.exit(1)
+
+    # Normalize and validate filter and exclude tags.
+    filters = [f.lower() for f in (args.filters or [])]
+    for f in filters:
+        if f not in _VALID_FILTER_TAGS:
+            print(
+                f"Error: unknown filter tag '{f}'. "
+                f"Valid tags: {', '.join(sorted(_VALID_FILTER_TAGS))}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+    excludes = [f.lower() for f in (args.excludes or [])]
+    for f in excludes:
+        if f not in _VALID_FILTER_TAGS:
+            print(
+                f"Error: unknown exclude tag '{f}'. "
+                f"Valid tags: {', '.join(sorted(_VALID_FILTER_TAGS))}",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     # Expand directories into individual MIDI file paths.
     expanded_paths = []
@@ -2415,20 +2521,29 @@ Examples:
             print(f"Error: path not found: {path}", file=sys.stderr)
             any_error = True
 
-    for i, filepath in enumerate(expanded_paths):
-        if i > 0 and not args.json:
-            print()
+    printed_count = 0
+    for filepath in expanded_paths:
         try:
             results = analyze_midi_file(filepath)
         except IOError as e:
-            print(e, file=sys.stderr)
+            if not args.paths_only:
+                print(e, file=sys.stderr)
             any_error = True
             continue
-        if args.json:
+
+        if (filters or excludes) and not _file_matches_filters(results, filters, excludes):
+            continue
+
+        if args.paths_only:
+            print(filepath)
+        elif args.json:
             import json
             print(json.dumps(results, indent=2))
         else:
+            if printed_count > 0:
+                print()
             print_results(results)
+            printed_count += 1
 
     if any_error:
         sys.exit(1)

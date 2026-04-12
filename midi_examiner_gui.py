@@ -15,7 +15,8 @@ try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget,
         QVBoxLayout, QHBoxLayout,
-        QPushButton, QLabel, QLineEdit, QTextEdit, QFileDialog, QTabWidget, QMenu,
+        QPushButton, QCheckBox, QGroupBox, QLabel, QLineEdit,
+        QTextEdit, QFileDialog, QTabWidget, QMenu,
         QListWidget, QListWidgetItem, QSplitter,
     )
     from PyQt6.QtGui import (QFont, QKeySequence, QAction,
@@ -558,6 +559,30 @@ _STANDARD_STYLES = {
 }
 
 
+# Standard filter checkboxes: (internal key, display label).
+# Multiple checked entries use OR logic — show files matching any checked standard.
+# Keys match the CLI --filter tag names.
+_STANDARD_FILTER_DEFS = [
+    ("GM",      "GM"),
+    ("GM2",     "GM2"),
+    ("GS",      "GS"),
+    ("XG",      "XG"),
+    ("unknown", "Unknown"),
+]
+
+# Modifier filter checkboxes: (internal key, display label, tooltip).
+# Tri-state: checked = show only files with this tag; partially checked (–) = hide those files.
+# Keys match the CLI --filter / --exclude tag names.
+_MODIFIER_FILTER_DEFS = [
+    ("assumed",  "[?]",
+     "Checked: show only files with an assumed standard\nPartially checked (\u2013): hide files with an assumed standard"),
+    ("warnings", "[!]",
+     "Checked: show only files with warnings\nPartially checked (\u2013): hide files with warnings"),
+    ("KAR",      "KAR",
+     "Checked: show only Soft Karaoke files\nPartially checked (\u2013): hide Soft Karaoke files"),
+]
+
+
 def _apply_standard_style(item, standard, has_warnings=False, assumed=False, is_karaoke=False):
     """Apply background/foreground colour and append tag(s) to item text.
 
@@ -760,8 +785,18 @@ class MidiExaminerWindow(QMainWindow):
         self._pending_paths = deque()  # analysis queue (FIFO)
         self._pending_set = set()      # O(1) membership test for _pending_paths
         self._sidebar_items = {}   # path -> QListWidgetItem (O(1) lookup)
+        self._file_tags = {}       # path -> {standard, has_warnings, assumed, is_karaoke}
         self._folder_count = 0     # number of folder-header rows in the sidebar
+        self._visible_count = 0    # number of visible (non-hidden) file items
         self._active_worker_path = None
+        # Keeps the last 2 retired AnalysisWorker Python wrappers alive after
+        # self.worker is reassigned.  Without this, Python GC deletes the
+        # wrapper immediately when self.worker = new_worker executes, which
+        # calls QThread::~QThread() while the thread is still in
+        # sip_api_end_thread() waiting for the GIL — an instant hard abort.
+        # By the time an entry is pushed out of this deque (when the NEXT
+        # worker finishes), the earlier thread has long since truly exited.
+        self._retired_workers = deque(maxlen=2)
 
         self._build_menu()
         self._build_ui()
@@ -831,6 +866,55 @@ class MidiExaminerWindow(QMainWindow):
         sidebar_layout = QVBoxLayout(sidebar_widget)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.setSpacing(4)
+
+        # Filter controls — shown above the file list.
+        # Standard checkboxes use OR logic: checking GM and GS shows files matching either.
+        # Modifier checkboxes are tri-state: checked = show only, partially checked (–) = hide.
+        filter_group = QGroupBox("Filter")
+        filter_font = filter_group.font()
+        filter_font.setPointSize(max(8, filter_font.pointSize() - 1))
+        filter_group.setFont(filter_font)
+        filter_vlayout = QVBoxLayout(filter_group)
+        filter_vlayout.setContentsMargins(4, 4, 4, 4)
+        filter_vlayout.setSpacing(3)
+
+        # Standard filter row: check any combination to show matching files (OR logic).
+        standard_row = QHBoxLayout()
+        standard_row.setSpacing(4)
+        self._standard_checks = {}   # key -> QCheckBox
+        for key, label in _STANDARD_FILTER_DEFS:
+            cb = QCheckBox(label)
+            cb.setFont(filter_font)
+            cb.setToolTip("Check to include files matching this MIDI standard (OR logic)")
+            cb.stateChanged.connect(self._on_filter_changed)
+            self._standard_checks[key] = cb
+            standard_row.addWidget(cb)
+        standard_row.addStretch()
+        filter_vlayout.addLayout(standard_row)
+
+        # Modifier filter row: tri-state checkboxes (checked = show only, – = hide).
+        modifier_row = QHBoxLayout()
+        modifier_row.setSpacing(4)
+        self._modifier_checks = {}   # key -> QCheckBox (tri-state)
+        for key, label, tip in _MODIFIER_FILTER_DEFS:
+            cb = QCheckBox(label)
+            cb.setFont(filter_font)
+            cb.setTristate(True)
+            cb.setToolTip(tip)
+            cb.stateChanged.connect(self._on_filter_changed)
+            cb.clicked.connect(self._make_modifier_cycle_handler(cb))
+            self._modifier_checks[key] = cb
+            modifier_row.addWidget(cb)
+        modifier_row.addStretch()
+        filter_vlayout.addLayout(modifier_row)
+        sidebar_layout.addWidget(filter_group)
+
+        # Debounce timer: coalesces rapid checkbox toggles so that at most one
+        # full O(n) filter scan runs per 100 ms burst of changes.
+        self._filter_timer = QTimer(self)
+        self._filter_timer.setSingleShot(True)
+        self._filter_timer.setInterval(100)
+        self._filter_timer.timeout.connect(self._apply_sidebar_filter)
 
         self.sidebar = QListWidget()
         self.sidebar.setMinimumWidth(80)
@@ -974,6 +1058,7 @@ class MidiExaminerWindow(QMainWindow):
         else:
             self.sidebar.addItem(item)
         self._sidebar_items[path] = item
+        self._visible_count += 1   # new items are always visible (pending, tags unknown)
         if select:
             self.sidebar.setCurrentItem(item)
         self.clear_button.setEnabled(True)
@@ -1004,26 +1089,208 @@ class MidiExaminerWindow(QMainWindow):
     def _update_sidebar_status(self):
         """Refresh the file/folder count label below the sidebar.
 
-        Uses pre-maintained counters (_file_order length and _folder_count)
-        so this is O(1) and safe to call on every sidebar mutation.
+        All values come from O(1) pre-maintained counters (_file_order length,
+        _folder_count, _visible_count) — never scans the sidebar or item list.
         """
         files = len(self._file_order)
         folders = self._folder_count
         if files == 0 and folders == 0:
             self.sidebar_status_label.setText("")
-        elif folders == 0:
-            self.sidebar_status_label.setText(f"{files} file{'s' if files != 1 else ''}")
+            return
+
+        has_active_filter = (
+            hasattr(self, '_standard_checks') and any(self._get_active_filters())
+        )
+        if has_active_filter:
+            file_str = f"{self._visible_count} of {files} file{'s' if files != 1 else ''}"
+        else:
+            file_str = f"{files} file{'s' if files != 1 else ''}"
+
+        if folders == 0:
+            self.sidebar_status_label.setText(file_str)
         else:
             self.sidebar_status_label.setText(
-                f"{files} file{'s' if files != 1 else ''}  ·  "
-                f"{folders} folder{'s' if folders != 1 else ''}"
+                f"{file_str}  ·  {folders} folder{'s' if folders != 1 else ''}"
             )
+
+    # ------------------------------------------------------------------
+    # Sidebar filter
+    # ------------------------------------------------------------------
+
+    def _get_active_filters(self):
+        """Return active filter state as (show_standards, show_modifiers, hide_modifiers).
+
+        show_standards: frozenset of standard keys checked for OR-inclusion;
+            empty means no standard filter (show all standards).
+        show_modifiers: frozenset of modifier keys in the checked (show-only) state.
+        hide_modifiers: frozenset of modifier keys in the partially-checked (hide) state.
+        """
+        show_standards = frozenset(
+            key for key, cb in self._standard_checks.items() if cb.isChecked()
+        )
+        show_modifiers = set()
+        hide_modifiers = set()
+        for key, cb in self._modifier_checks.items():
+            state = cb.checkState()
+            if state == Qt.CheckState.Checked:
+                show_modifiers.add(key)
+            elif state == Qt.CheckState.PartiallyChecked:
+                hide_modifiers.add(key)
+        return show_standards, frozenset(show_modifiers), frozenset(hide_modifiers)
+
+    @staticmethod
+    def _make_modifier_cycle_handler(cb):
+        """Return a clicked-signal handler that enforces the desired tri-state cycle.
+
+        PyQt's default tri-state cycle is Unchecked → PartiallyChecked → Checked.
+        The desired cycle is Unchecked → Checked (show only) → PartiallyChecked (hide).
+
+        Remapping the already-changed state is unreliable because the override changes
+        what Qt uses as the starting point for the *next* click.  Instead, this handler
+        tracks the logical step (0/1/2) in a closure variable and always forces the
+        correct Qt state directly, ignoring whatever Qt already set.
+        """
+        _step = [0]  # mutable: 0=off, 1=show only (Checked), 2=hide (PartiallyChecked)
+        _qt_states = [
+            Qt.CheckState.Unchecked,
+            Qt.CheckState.Checked,
+            Qt.CheckState.PartiallyChecked,
+        ]
+
+        def handler(_=None):
+            _step[0] = (_step[0] + 1) % 3
+            cb.setCheckState(_qt_states[_step[0]])
+
+        return handler
+
+    def _on_filter_changed(self):
+        """Called when any standard or modifier checkbox changes state.
+
+        Restarts the debounce timer rather than applying immediately, so that
+        rapid successive changes collapse into a single O(n) scan.
+        """
+        self._filter_timer.start()  # (re)starts the 100 ms single-shot timer
+
+    def _apply_sidebar_filter(self):
+        """Show or hide sidebar file items based on the active filters.
+
+        Folder-header items are always kept visible.  Pending (not yet
+        analyzed) items are always shown since their tags are unknown.
+        Standard filters use OR logic; modifier filters use AND logic for
+        show-only and exclude logic for hide.
+
+        This is the only place in the class that does an O(n) sidebar scan;
+        it is only reached via the debounce timer (_filter_timer) so at most
+        one scan runs per 100 ms burst of checkbox changes.
+
+        Design notes:
+        - Do NOT use blockSignals(True) on the sidebar.  It suppresses the
+          user-facing currentItemChanged signal but not Qt's internal
+          model/view sync; hiding the current item while signals are blocked
+          leaves the widget in an inconsistent state that causes a hard crash.
+        - Do NOT use sidebar.setUpdatesEnabled(False).  That targets the
+          scroll-area frame, not the viewport where items are painted.  Use
+          sidebar.viewport().setUpdatesEnabled(False) instead.
+        - Pre-clear the selection before the loop when the current item will
+          be hidden.  With no current item, setHidden() on any other item
+          does not trigger currentItemChanged, preventing the O(n) cascade
+          of auto-select → hide → auto-select → … that would otherwise fire
+          _on_sidebar_selection_changed (and potentially _populate_tabs) for
+          every hidden item in the list.
+        - Iterate _file_order (a Python list with O(1) dict lookups via
+          _sidebar_items) rather than range(sidebar.count()) + sidebar.item(i)
+          (N indexed Qt calls), which is noticeably faster on large lists.
+        - Skip setHidden() when the visibility state has not changed to
+          reduce unnecessary Qt model/view work.
+        _visible_count is maintained here so all subsequent
+        _update_sidebar_status calls stay O(1).
+        """
+        show_standards, show_modifiers, hide_modifiers = self._get_active_filters()
+        has_filter = bool(show_standards or show_modifiers or hide_modifiers)
+
+        # Pre-clear the selection if the currently selected file item will not
+        # survive the new filter.  This must happen before the loop so that
+        # hiding it in the loop does not trigger the currentItemChanged cascade.
+        current = self.sidebar.currentItem()
+        if current:
+            cur_path = current.data(Qt.ItemDataRole.UserRole)
+            if cur_path:  # skip folder headers (no path data)
+                cur_tags = self._file_tags.get(cur_path)
+                # Only clear if the item has known tags and will be hidden.
+                # Pending items (cur_tags is None) always remain visible.
+                if cur_tags is not None and has_filter \
+                        and not self._matches_filters(cur_tags, show_standards,
+                                                      show_modifiers, hide_modifiers):
+                    self.sidebar.clearSelection()
+                    self.tab_widget.clear()
+                    self.file_path_edit.clear()
+
+        visible = 0
+        vp = self.sidebar.viewport()
+        vp.setUpdatesEnabled(False)
+        try:
+            for path in self._file_order:
+                item = self._sidebar_items.get(path)
+                if item is None:
+                    continue
+                tags = self._file_tags.get(path)
+                show = (tags is None) or (not has_filter) \
+                    or self._matches_filters(tags, show_standards,
+                                             show_modifiers, hide_modifiers)
+                if item.isHidden() == show:   # state needs to change
+                    item.setHidden(not show)
+                if show:
+                    visible += 1
+        finally:
+            vp.setUpdatesEnabled(True)
+
+        self._visible_count = visible
+        self._update_sidebar_status()
+
+    @staticmethod
+    def _matches_filters(tags, show_standards, show_modifiers, hide_modifiers):
+        """Return True if *tags* satisfies the active filter state.
+
+        *tags* is the dict stored in _file_tags.
+        show_standards: OR logic — file must match at least one (empty = no standard filter).
+        show_modifiers: AND logic — file must have all listed tags.
+        hide_modifiers: file must have none of the listed tags.
+        """
+        if show_standards:
+            file_std = tags.get('standard', '')
+            matched = False
+            for s in show_standards:
+                if s == 'unknown' and not file_std:
+                    matched = True
+                    break
+                if s == file_std:
+                    matched = True
+                    break
+            if not matched:
+                return False
+        for key in show_modifiers:
+            if key == 'assumed' and not tags.get('assumed'):
+                return False
+            if key == 'warnings' and not tags.get('has_warnings'):
+                return False
+            if key == 'KAR' and not tags.get('is_karaoke'):
+                return False
+        for key in hide_modifiers:
+            if key == 'assumed' and tags.get('assumed'):
+                return False
+            if key == 'warnings' and tags.get('has_warnings'):
+                return False
+            if key == 'KAR' and tags.get('is_karaoke'):
+                return False
+        return True
 
     def _clear_files(self):
         self._pending_paths.clear()
         self._pending_set.clear()
         self._sidebar_items.clear()
+        self._file_tags.clear()
         self._folder_count = 0
+        self._visible_count = 0
         self._file_sections.clear()
         self._file_order.clear()
         self.sidebar.clear()
@@ -1039,15 +1306,23 @@ class MidiExaminerWindow(QMainWindow):
         path = self._pending_paths.popleft()
         self._pending_set.discard(path)
         self._active_worker_path = path
-        self.statusBar().showMessage(f"Analyzing: {os.path.basename(path)}")
+        self.statusBar().showMessage(f"Examining: {os.path.basename(path)}")
         worker = AnalysisWorker(path)
         worker.finished.connect(self._on_analysis_done)
         worker.error.connect(self._on_analysis_error)
-        # Schedule the old worker for deletion via Qt's event loop rather than
-        # relying on Python GC, which may run while the thread is still doing
-        # OS-level teardown after run() returns.
+        # deleteLater schedules C++ destruction via Qt's event loop.
         worker.finished.connect(worker.deleteLater)
         worker.error.connect(worker.deleteLater)
+        # Move the current worker into _retired_workers BEFORE overwriting
+        # self.worker.  The assignment self.worker = worker would otherwise
+        # drop the old wrapper's refcount to zero, triggering immediate Python
+        # GC and QThread::~QThread() while the thread is still alive in
+        # sip_api_end_thread() — a fatal Qt abort.  The deque keeps the
+        # wrapper alive; its maxlen ensures entries are released only after
+        # at least one more full worker cycle has completed, by which time
+        # the previous thread has truly exited.
+        if self.worker is not None:
+            self._retired_workers.append(self.worker)
         self.worker = worker
         worker.start()
 
@@ -1065,14 +1340,43 @@ class MidiExaminerWindow(QMainWindow):
         # viewed so that the main thread is not blocked parsing every file's
         # output up-front during a large batch analysis.
         self._file_sections[path] = text
-        # Colour and tag the sidebar item for this file — O(1) via dict.
+        # Store per-file tags so the sidebar filter can evaluate this file.
+        self._file_tags[path] = {
+            'standard': standard,
+            'has_warnings': has_warnings,
+            'assumed': assumed,
+            'is_karaoke': is_karaoke,
+        }
+        # Color and tag the sidebar item for this file — O(1) via dict.
         item = self._sidebar_items.get(path)
         if item:
             _apply_standard_style(item, standard, has_warnings, assumed, is_karaoke)
+            # Apply the active filter to this newly analyzed item.
+            # The item was visible while pending; decrement _visible_count if
+            # the filter now hides it.  _update_sidebar_status() reads the
+            # counter, so this stays O(1) even during bulk analysis.
+            # If this item is currently selected, clear the selection before
+            # hiding it — same pre-clear pattern as _apply_sidebar_filter —
+            # to prevent the currentItemChanged auto-select cascade.
+            show_standards, show_modifiers, hide_modifiers = self._get_active_filters()
+            has_filter = bool(show_standards or show_modifiers or hide_modifiers)
+            if has_filter and not self._matches_filters(self._file_tags[path],
+                                                        show_standards, show_modifiers,
+                                                        hide_modifiers):
+                if self.sidebar.currentItem() is item:
+                    self.sidebar.clearSelection()
+                    self.tab_widget.clear()
+                    self.file_path_edit.clear()
+                item.setHidden(True)
+                self._visible_count -= 1
+                self._update_sidebar_status()
         current = self.sidebar.currentItem()
         if current and current.data(Qt.ItemDataRole.UserRole) == path:
             self._populate_tabs(path)
-        self.statusBar().showMessage(f"Analysis complete: {os.path.basename(path)}")
+        if self._pending_paths:
+            self.statusBar().showMessage(f"Examined: {os.path.basename(path)}")
+        else:
+            self.statusBar().showMessage("All files examined.")
         self._start_next_worker()
 
     def _on_analysis_error(self, message):
