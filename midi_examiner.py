@@ -17,7 +17,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.2.0"
+__version__ = "1.2.1"
 
 # ── Terminal colour support ───────────────────────────────────────────────────
 
@@ -1140,6 +1140,7 @@ def analyze_midi_file(filepath):
                     "seconds": msg.seconds,
                     "frames": msg.frames,
                     "sub_frames": msg.sub_frames,
+                    "frame_rate": msg.frame_rate,
                     "formatted": format_smpte(msg.hours, msg.minutes, msg.seconds,
                                              msg.frames, msg.sub_frames)
                 }
@@ -1150,6 +1151,38 @@ def analyze_midi_file(filepath):
                 results["metadata"]["instruments"].append({
                     "track": track_idx,
                     "name": decode_midi_text(msg.name)
+                })
+
+            elif msg.type == 'device_name':
+                if "device_names" not in results["metadata"]:
+                    results["metadata"]["device_names"] = []
+                results["metadata"]["device_names"].append({
+                    "track": track_idx,
+                    "name": decode_midi_text(msg.name)
+                })
+
+            elif msg.type == 'midi_port':
+                if "midi_ports" not in results["metadata"]:
+                    results["metadata"]["midi_ports"] = []
+                # Deduplicate: skip if this (track, port) pair was already recorded.
+                already = any(
+                    e["track"] == track_idx and e["port"] == msg.port
+                    for e in results["metadata"]["midi_ports"]
+                )
+                if not already:
+                    results["metadata"]["midi_ports"].append({
+                        "track": track_idx,
+                        "port": msg.port
+                    })
+
+            elif msg.type == 'unknown_meta' and msg.type_byte == 0x08:
+                # Program Name (0xFF 0x08) — not a built-in mido meta type;
+                # data arrives as a tuple of raw bytes.
+                if "program_names" not in results["metadata"]:
+                    results["metadata"]["program_names"] = []
+                results["metadata"]["program_names"].append({
+                    "track": track_idx,
+                    "name": decode_midi_text(bytes(msg.data).decode('latin-1'))
                 })
 
             elif msg.type == 'lyrics':
@@ -2182,7 +2215,11 @@ def print_results(results):
 
     if "smpte_offset" in timing:
         print_subsection("SMPTE Offset")
-        print(f"  Offset:        {timing['smpte_offset']['formatted']}")
+        smpte = timing['smpte_offset']
+        fps = smpte['frame_rate']
+        fps_str = f"{int(fps)}" if fps == int(fps) else f"{fps}"
+        print(f"  Frame Rate:    {fps_str} fps")
+        print(f"  Offset:        {smpte['formatted']}")
 
     # Metadata
     print_section("METADATA")
@@ -2204,7 +2241,24 @@ def print_results(results):
         for inst in meta["instruments"]:
             print(f"    Track {inst['track']}: {sanitize_text(inst['name'])}")
 
-    if not any(key in meta for key in ["sequence_name", "copyright", "key_signature", "instruments"]):
+    if "program_names" in meta:
+        print_subsection("Program Names")
+        for pn in meta["program_names"]:
+            print(f"    Track {pn['track']}: {sanitize_text(pn['name'])}")
+
+    if "device_names" in meta:
+        print_subsection("Device Names")
+        for dn in meta["device_names"]:
+            print(f"    Track {dn['track']}: {sanitize_text(dn['name'])}")
+
+    if "midi_ports" in meta:
+        print_subsection("MIDI Ports")
+        for mp in meta["midi_ports"]:
+            print(f"    Track {mp['track']}: Port {mp['port']}")
+
+    if not any(key in meta for key in ["sequence_name", "copyright", "key_signature",
+                                        "instruments", "program_names", "device_names",
+                                        "midi_ports"]):
         print("  (No metadata found)")
 
     # Track Information

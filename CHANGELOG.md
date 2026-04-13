@@ -1,5 +1,9 @@
 # Changelog
 
+### 1.2.1
+- **Metadata: MIDI Port, Device Name, and Program Name now displayed:** The Metadata section now shows MIDI Port (0xFF 0x21), Device Name (0xFF 0x09), and Program Name (0xFF 0x08) meta events, each grouped by track under their own subsection. Duplicate MIDI Port entries for the same track and port value are deduplicated.
+- **Timing: SMPTE Offset now shows frame rate:** The SMPTE Offset subsection in Timing Information now displays the frame rate (e.g. 24, 25, 29.97, or 30 fps) encoded in the meta event, in addition to the offset time code.
+
 ### 1.2.0
 - **Filter: standard tags use OR logic (CLI and GUI):** Specifying multiple standard filter tags (`--filter GM --filter GS`) now shows files matching any of the listed standards rather than requiring all to match. The GUI replaces the single standard drop-down with individual checkboxes for GM, GM2, GS, XG, and Unknown; checking any combination shows files matching any checked standard.
 - **Filter: hide modifier (`--exclude` / GUI tri-state checkboxes):** A new `--exclude TAG` CLI option hides files matching the given tag (repeatable; valid for all tags including standards). In the GUI, the [?], [!], and KAR modifier checkboxes are now tri-state: one click = show only, second click = hide (shown as –), third click = off.
