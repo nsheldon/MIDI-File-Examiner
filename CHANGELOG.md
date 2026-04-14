@@ -1,5 +1,12 @@
 # Changelog
 
+### 1.3.0
+- **Advanced filter (CLI and GUI):** Filter on any combination of file properties beyond the basic standard/tag filters. Properties include duration, MIDI format type, track count, note range, velocity range, peak polyphony, key signature, timing type (PPQ/SMPTE), time signature, tempo range, CC numbers used, polyphonic and channel aftertouch, Roland SC minimum version, and Yamaha XG minimum level. Text search performs a case-insensitive substring match across all text events, track names, instrument names, patch names, and metadata. SysEx pattern search matches a hex byte sequence against any SysEx message in the file. CLI exposes all filters as individual flags (see `--help`); multiple `--key-sig` or `--sc-version` values are OR'd together.
+- **GUI: Advanced Filter dialog:** An "Advanced…" button in the filter bar opens a scrollable dialog with four sections — File Info, Notes & Velocity, Timing & Events, and Search. The button label shows a dot (●) when any advanced filter is active beyond the default state. Selecting a Roland SC version automatically checks the GS standard checkbox; selecting an XG level automatically checks XG. Unchecking GS or XG clears the corresponding sub-filters immediately without opening the dialog.
+- **GUI: Reset button:** A Reset button in the filter bar clears all standard checkboxes, modifier checkboxes, and advanced filters in one click.
+- **GUI: progress bar during multi-file analysis:** When analyzing two or more files, a progress bar appears on the right side of the status bar showing the count of completed vs. total files. It disappears automatically when the last file finishes and resets on the next batch.
+- **Fix: instrument names and patch names missing from text search:** MIDI `instrument_name` meta events (shown in the Metadata section under Instrument Names) and resolved program/patch names from the Program Changes section were not included in the text search corpus. Both are now searchable.
+
 ### 1.2.1
 - **Metadata: MIDI Port, Device Name, and Program Name now displayed:** The Metadata section now shows MIDI Port (0xFF 0x21), Device Name (0xFF 0x09), and Program Name (0xFF 0x08) meta events, each grouped by track under their own subsection. Duplicate MIDI Port entries for the same track and port value are deduplicated.
 - **Timing: SMPTE Offset now shows frame rate:** The SMPTE Offset subsection in Timing Information now displays the frame rate (e.g. 24, 25, 29.97, or 30 fps) encoded in the meta event, in addition to the offset time code.

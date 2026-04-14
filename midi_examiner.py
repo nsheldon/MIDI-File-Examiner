@@ -8,6 +8,7 @@ metadata, timing information, and message details from MIDI files.
 import sys
 import os
 import io
+import re
 import argparse
 from collections import defaultdict
 
@@ -17,7 +18,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 
 # ── Terminal colour support ───────────────────────────────────────────────────
 
@@ -1175,6 +1176,14 @@ def analyze_midi_file(filepath):
                         "port": msg.port
                     })
 
+            elif msg.type == 'sequencer_specific':
+                if "sequencer_specific" not in results["metadata"]:
+                    results["metadata"]["sequencer_specific"] = []
+                results["metadata"]["sequencer_specific"].append({
+                    "track": track_idx,
+                    "data_hex": ' '.join(f'{b:02X}' for b in msg.data)
+                })
+
             elif msg.type == 'unknown_meta' and msg.type_byte == 0x08:
                 # Program Name (0xFF 0x08) — not a built-in mido meta type;
                 # data arrives as a tuple of raw bytes.
@@ -2256,9 +2265,14 @@ def print_results(results):
         for mp in meta["midi_ports"]:
             print(f"    Track {mp['track']}: Port {mp['port']}")
 
+    if "sequencer_specific" in meta:
+        print_subsection("Sequencer Specific")
+        for ss in meta["sequencer_specific"]:
+            print(f"    Track {ss['track']}: {ss['data_hex']}")
+
     if not any(key in meta for key in ["sequence_name", "copyright", "key_signature",
                                         "instruments", "program_names", "device_names",
-                                        "midi_ports"]):
+                                        "midi_ports", "sequencer_specific"]):
         print("  (No metadata found)")
 
     # Track Information
@@ -2494,6 +2508,415 @@ def _file_matches_filters(results, filters, excludes=()):
     return True
 
 
+def _parse_note(s):
+    """Parse a MIDI note as an integer (0-127) or a note name (e.g. C4, D#3, Bb2).
+
+    Uses the MIDI convention where C4 = 60 (middle C).
+    Used as an argparse type callable for --min-note / --max-note.
+    """
+    try:
+        n = int(s)
+        if 0 <= n <= 127:
+            return n
+        raise argparse.ArgumentTypeError(
+            f"MIDI note number must be 0-127, got {n}")
+    except ValueError:
+        pass
+    m = re.match(r'^([A-Ga-g])([#b]?)(-?\d+)$', s.strip())
+    if m:
+        name     = m.group(1).upper()
+        acc      = m.group(2)
+        octave   = int(m.group(3))
+        semitone = {'C': 0, 'D': 2, 'E': 4, 'F': 5,
+                    'G': 7, 'A': 9, 'B': 11}[name]
+        if acc == '#':
+            semitone += 1
+        elif acc == 'b':
+            semitone -= 1
+        n = (octave + 1) * 12 + semitone
+        if 0 <= n <= 127:
+            return n
+        raise argparse.ArgumentTypeError(
+            f"Note '{s}' resolves to MIDI number {n}, which is outside the valid range 0-127")
+    raise argparse.ArgumentTypeError(
+        f"Invalid note: '{s}'. Use a MIDI number (0-127) or a note name "
+        f"(e.g. C4, D#3, Bb2)")
+
+
+def _parse_duration(s):
+    """Parse a duration as seconds (float) or in M:SS or H:MM:SS format.
+
+    Examples: '90', '1:30', '1:30:00'
+    Used as an argparse type callable for --min-duration / --max-duration.
+    """
+    try:
+        v = float(s)
+        if v < 0:
+            raise argparse.ArgumentTypeError(
+                f"Duration must be non-negative, got {v}")
+        return v
+    except ValueError:
+        pass
+    parts = s.split(':')
+    try:
+        if len(parts) == 2:
+            return int(parts[0]) * 60 + float(parts[1])
+        if len(parts) == 3:
+            return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    except (ValueError, IndexError):
+        pass
+    raise argparse.ArgumentTypeError(
+        f"Invalid duration: '{s}'. Use seconds (e.g. 90), M:SS (e.g. 1:30), "
+        f"or H:MM:SS (e.g. 1:30:00)")
+
+
+_TIME_SIG_VALID_DENOMS = frozenset({1, 2, 4, 8, 16, 32, 64, 128})
+
+# All valid MIDI key signatures in mido string format, circle-of-fifths order.
+# Major keys first (7 flats → 7 sharps), then relative minor keys.
+_KEY_SIGNATURES = [
+    'Cb', 'Gb', 'Db', 'Ab', 'Eb', 'Bb', 'F',
+    'C', 'G', 'D', 'A', 'E', 'B', 'F#', 'C#',
+    'Abm', 'Ebm', 'Bbm', 'Fm', 'Cm', 'Gm', 'Dm',
+    'Am', 'Em', 'Bm', 'F#m', 'C#m', 'G#m', 'D#m', 'A#m',
+]
+
+
+def _key_display_name(key):
+    """Return a human-readable label for a mido key signature string.
+
+    Examples: 'C' → 'C major', 'Am' → 'A minor', 'F#m' → 'F# minor'.
+    """
+    if key.endswith('m'):
+        return f"{key[:-1]} minor"
+    return f"{key} major"
+
+
+def _parse_time_sig(s):
+    """Parse a time signature string 'N/D' for argparse.
+
+    N must be 1-255; D must be a power of 2 (1, 2, 4, 8, 16, 32, 64, or 128).
+    Returns a (numerator, denominator) int tuple.
+    Used as an argparse type callable for --time-sig.
+    """
+    _err = (f"invalid time signature '{s}': expected N/D where N is 1-255 "
+            f"and D is a power of 2 up to 128 (e.g. 4/4, 3/4, 6/8)")
+    parts = s.split('/')
+    if len(parts) != 2:
+        raise argparse.ArgumentTypeError(_err)
+    try:
+        num, denom = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise argparse.ArgumentTypeError(_err)
+    if not (1 <= num <= 255):
+        raise argparse.ArgumentTypeError(
+            f"time signature numerator must be 1-255, got {num}")
+    if denom not in _TIME_SIG_VALID_DENOMS:
+        raise argparse.ArgumentTypeError(
+            f"time signature denominator must be a power of 2 "
+            f"(1, 2, 4, 8, 16, 32, 64, or 128), got {denom}")
+    return (num, denom)
+
+
+def _filter_summary(results):
+    """Extract a flat dict of filterable properties from analysis results.
+
+    Called by both the CLI and GUI to evaluate advanced filter conditions
+    without re-running analysis.  All values are simple Python types
+    (int, float, bool, str, frozenset).
+
+    Keys returned (some may be absent when data is unavailable):
+        duration               – float, file length in seconds
+        format                 – int, MIDI format type (0, 1, or 2)
+        num_tracks             – int, number of tracks
+        note_min               – int, global minimum MIDI note (0-127)
+        note_max               – int, global maximum MIDI note (0-127)
+        vel_min                – int, global minimum note-on velocity (1-127)
+        vel_max                – int, global maximum note-on velocity (1-127)
+        peak_polyphony         – int, global peak simultaneous notes
+        has_poly_aftertouch    – bool
+        has_channel_aftertouch – bool
+        has_pitch_bend         – bool
+        cc_numbers             – frozenset of int, all CC numbers used
+        tempo_min              – float, minimum tempo in BPM
+        tempo_max              – float, maximum tempo in BPM
+        timing_type            – str, 'PPQ' or 'SMPTE'
+        time_signatures        – frozenset of (numerator, denominator) int tuples
+        sysex_hex              – str, all SysEx byte sequences as hex, one per line
+        all_text               – str, all text events and metadata joined
+    """
+    summary = {}
+
+    fi = results.get('file_info', {})
+    if fi.get('length_seconds') is not None:
+        summary['duration'] = fi['length_seconds']
+    if fi.get('format') is not None:
+        summary['format'] = fi['format']
+    if fi.get('num_tracks') is not None:
+        summary['num_tracks'] = fi['num_tracks']
+
+    timing = results.get('timing', {})
+    tt = timing.get('timing_type')
+    if tt:
+        summary['timing_type'] = tt
+    ts_list = timing.get('time_signatures_abs', [])
+    if ts_list:
+        summary['time_signatures'] = frozenset(
+            (ts['numerator'], ts['denominator']) for ts in ts_list
+        )
+
+    stats  = results.get('statistics', {})
+    by_ch  = stats.get('by_channel', {})
+
+    note_mins, note_maxes = [], []
+    vel_mins, vel_maxes   = [], []
+    cc_set      = set()
+    has_poly_at = False
+    has_ch_at   = False
+    has_pb      = False
+
+    for ch_data in by_ch.values():
+        if ch_data.get('note_count', 0) > 0:
+            note_mins.append(ch_data['pitch_min'])
+            note_maxes.append(ch_data['pitch_max'])
+            vel_mins.append(ch_data['vel_min'])
+            vel_maxes.append(ch_data['vel_max'])
+        cc_set.update(ch_data.get('control_changes', {}).keys())
+        if ch_data.get('poly_aftertouch_count', 0) > 0:
+            has_poly_at = True
+        if ch_data.get('aftertouch'):
+            has_ch_at = True
+        if ch_data.get('pitch_bend'):
+            has_pb = True
+
+    if note_mins:
+        summary['note_min'] = min(note_mins)
+        summary['note_max'] = max(note_maxes)
+        summary['vel_min']  = min(vel_mins)
+        summary['vel_max']  = max(vel_maxes)
+
+    summary['peak_polyphony']         = stats.get('global_peak_polyphony', 0)
+    summary['has_poly_aftertouch']    = has_poly_at
+    summary['has_channel_aftertouch'] = has_ch_at
+    summary['has_pitch_bend']         = has_pb
+    summary['cc_numbers']             = frozenset(cc_set)
+
+    tempos = results.get('timing', {}).get('tempo', [])
+    if tempos:
+        bpms = [t['bpm'] for t in tempos]
+        summary['tempo_min'] = min(bpms)
+        summary['tempo_max'] = max(bpms)
+
+    # SysEx corpus: one message per line so patterns don't span message boundaries.
+    # Each line is prefixed with "F0" because mido strips the implicit start byte
+    # from msg.data; users expect to be able to search for patterns like "F0 41".
+    sysex_lines = [
+        'F0 ' + sx['data_hex']
+        for sx in results.get('sysex', [])
+        if sx.get('data_hex')
+    ]
+    summary['sysex_hex'] = '\n'.join(sysex_lines)
+
+    # Text corpus: all text events, metadata, and track names joined.
+    text_parts = []
+    for t in results.get('text_events', []):
+        if t.get('text'):
+            text_parts.append(t['text'])
+    for mk in results.get('markers', []):
+        if mk.get('marker'):
+            text_parts.append(mk['marker'])
+    for cp in results.get('cue_points', []):
+        if cp.get('cue'):
+            text_parts.append(cp['cue'])
+    md = results.get('metadata', {})
+    for key in ('sequence_name', 'copyright'):
+        if md.get(key):
+            text_parts.append(md[key])
+    for trk in results.get('tracks', []):
+        if trk.get('name'):
+            text_parts.append(trk['name'])
+    for lyr in md.get('lyrics', []):
+        if lyr.get('text'):
+            text_parts.append(lyr['text'])
+    for inst in md.get('instruments', []):
+        if inst.get('name'):
+            text_parts.append(inst['name'])
+    for dev in md.get('device_names', []):
+        if dev.get('name'):
+            text_parts.append(dev['name'])
+    for pn in md.get('program_names', []):
+        if pn.get('name'):
+            text_parts.append(pn['name'])
+    for pc in results.get('program_changes', []):
+        if pc.get('program_name'):
+            text_parts.append(pc['program_name'])
+    summary['all_text'] = '\n'.join(text_parts)
+
+    # Key signature (first one encountered; most files have only one).
+    ks = results.get('metadata', {}).get('key_signature', {}).get('key')
+    if ks:
+        summary['key_signature'] = ks
+
+    # Roland SC minimum version (GS files only).
+    gs_info = results.get('gs_info')
+    if gs_info and gs_info.get('minimum_sc_generation') is not None:
+        summary['sc_generation'] = gs_info['minimum_sc_generation']
+
+    # Yamaha XG minimum level (XG files only).
+    xg_info = results.get('xg_info')
+    if xg_info and xg_info.get('minimum_xg_level') is not None:
+        summary['xg_level'] = xg_info['minimum_xg_level']
+
+    return summary
+
+
+def _matches_advanced_filters(summary, adv):
+    """Return True if *summary* satisfies all conditions in *adv*.
+
+    *adv* is a dict of advanced filter settings.  Any key that is absent or
+    falsy (None, 0, empty set/string) is treated as "no constraint".
+
+    Filter semantics:
+        min_duration / max_duration   – inclusive bounds on file length (seconds)
+        formats                       – set; file format type must be in this set
+        timing_type                   – string 'PPQ' or 'SMPTE'; file's timing type must match
+        time_signature                – (numerator, denominator) tuple; this time signature
+                                        must appear somewhere in the file
+        key_signatures                – set of mido key strings (e.g. {'C', 'Am'}); file's
+                                        key signature must be in the set (OR logic)
+        min_tracks / max_tracks       – inclusive bounds on track count
+        min_note / max_note           – file's global min/max note must be >= / <=
+        min_velocity / max_velocity   – file's global min/max velocity must be >= / <=
+        min_polyphony / max_polyphony – global peak polyphony must be >= / <=
+        min_tempo / max_tempo         – file's tempo range must overlap with [min, max]
+        cc_numbers                    – set; ALL listed CCs must be present (AND logic)
+        poly_aftertouch               – True=must have, False=must not have, None=either
+        channel_aftertouch            – True=must have, False=must not have, None=either
+        search_text                   – substring must appear in text corpus (case-insensitive)
+        sysex_pattern                 – hex substring must appear in SysEx corpus
+        sc_versions                   – set of ints; file's minimum SC generation must be in
+                                        set (1=SC-55, 2=SC-88, 3=SC-88Pro, 4=SC-8850).
+                                        When both sc_versions and xg_levels are set they are
+                                        OR'd: a file needs to satisfy only one of the two.
+        xg_levels                     – set of ints; file's minimum XG level must be in set
+                                        (1=Level 1/MU50+, 2=Level 2/MU100, 3=Level 3/MU128).
+                                        OR'd with sc_versions when both are present.
+    """
+    if not adv:
+        return True
+
+    dur = summary.get('duration')
+    lo  = adv.get('min_duration')
+    hi  = adv.get('max_duration')
+    if lo is not None and (dur is None or dur < lo):
+        return False
+    if hi is not None and (dur is None or dur > hi):
+        return False
+
+    fmts = adv.get('formats')
+    if fmts and summary.get('format') not in fmts:
+        return False
+
+    tt_filter = adv.get('timing_type')
+    if tt_filter and summary.get('timing_type') != tt_filter:
+        return False
+
+    ts_filter = adv.get('time_signature')
+    if ts_filter:
+        if ts_filter not in summary.get('time_signatures', frozenset()):
+            return False
+
+    ks_filter = adv.get('key_signatures')
+    if ks_filter and summary.get('key_signature') not in ks_filter:
+        return False
+
+    nt = summary.get('num_tracks')
+    lo = adv.get('min_tracks')
+    hi = adv.get('max_tracks')
+    if lo is not None and (nt is None or nt < lo):
+        return False
+    if hi is not None and (nt is None or nt > hi):
+        return False
+
+    note_min = summary.get('note_min')
+    note_max = summary.get('note_max')
+    lo = adv.get('min_note')
+    hi = adv.get('max_note')
+    if lo is not None and (note_min is None or note_min < lo):
+        return False
+    if hi is not None and (note_max is None or note_max > hi):
+        return False
+
+    vel_min = summary.get('vel_min')
+    vel_max = summary.get('vel_max')
+    lo = adv.get('min_velocity')
+    hi = adv.get('max_velocity')
+    if lo is not None and (vel_min is None or vel_min < lo):
+        return False
+    if hi is not None and (vel_max is None or vel_max > hi):
+        return False
+
+    poly = summary.get('peak_polyphony', 0)
+    lo   = adv.get('min_polyphony')
+    hi   = adv.get('max_polyphony')
+    if lo is not None and poly < lo:
+        return False
+    if hi is not None and poly > hi:
+        return False
+
+    lo = adv.get('min_tempo')
+    hi = adv.get('max_tempo')
+    if lo is not None or hi is not None:
+        t_min = summary.get('tempo_min', 120.0)
+        t_max = summary.get('tempo_max', 120.0)
+        if lo is not None and t_max < lo:
+            return False
+        if hi is not None and t_min > hi:
+            return False
+
+    cc_filter = adv.get('cc_numbers')
+    if cc_filter:
+        cc_have = summary.get('cc_numbers', frozenset())
+        if not cc_filter.issubset(cc_have):
+            return False
+
+    pat = adv.get('poly_aftertouch')
+    if pat is True  and not summary.get('has_poly_aftertouch'):
+        return False
+    if pat is False and summary.get('has_poly_aftertouch'):
+        return False
+
+    cat = adv.get('channel_aftertouch')
+    if cat is True  and not summary.get('has_channel_aftertouch'):
+        return False
+    if cat is False and summary.get('has_channel_aftertouch'):
+        return False
+
+    text_q = adv.get('search_text', '').strip()
+    if text_q and text_q.lower() not in summary.get('all_text', '').lower():
+        return False
+
+    sysex_q = adv.get('sysex_pattern', '').strip()
+    if sysex_q:
+        needle   = ''.join(sysex_q.upper().split())
+        haystack = ''.join(summary.get('sysex_hex', '').upper().split())
+        if needle not in haystack:
+            return False
+
+    sc_versions = adv.get('sc_versions')
+    xg_levels = adv.get('xg_levels')
+    if sc_versions or xg_levels:
+        # Each sub-standard filter ANDs with its parent standard (GS or XG),
+        # but the two groups are OR'd with each other so that selecting, e.g.,
+        # SC-55 AND XG Level 2 shows GS/SC-55 files OR XG/Level-2 files.
+        sc_match = bool(sc_versions) and summary.get('sc_generation') in sc_versions
+        xg_match = bool(xg_levels) and summary.get('xg_level') in xg_levels
+        if not (sc_match or xg_match):
+            return False
+
+    return True
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="MIDI File Examiner - Analyze MIDI files and display comprehensive information",
@@ -2531,6 +2954,78 @@ Examples:
     parser.add_argument("--version", action="version",
                         version=f"%(prog)s {__version__}")
 
+    adv = parser.add_argument_group("advanced filters")
+    adv.add_argument("--min-duration", type=_parse_duration, metavar="DUR",
+                     help="Show only files with a duration >= DUR seconds (or M:SS or H:MM:SS)")
+    adv.add_argument("--max-duration", type=_parse_duration, metavar="DUR",
+                     help="Show only files with a duration <= DUR seconds (or M:SS or H:MM:SS)")
+    adv.add_argument("--format", dest="format_type", type=int, choices=[0, 1, 2],
+                     metavar="TYPE",
+                     help="Show only files of this MIDI format type (0, 1, or 2)")
+    adv.add_argument("--timing-type", dest="timing_type",
+                     choices=["PPQ", "SMPTE"], metavar="TYPE",
+                     help="Show only files using this timing type (PPQ or SMPTE)")
+    adv.add_argument("--time-sig", dest="time_sig", type=_parse_time_sig, metavar="N/D",
+                     help=("Show only files that contain this time signature "
+                           "(e.g. 4/4, 3/4, 6/8); denominator must be a power of 2 "
+                           "up to 128"))
+    adv.add_argument("--key-sig", dest="key_sigs", action="append",
+                     choices=_KEY_SIGNATURES, metavar="KEY",
+                     help=("Show only files whose key signature matches KEY "
+                           "(e.g. C, Am, F#m, Bb); minor keys end with 'm'. "
+                           "May be repeated for OR logic: "
+                           "--key-sig C --key-sig Am"))
+    adv.add_argument("--min-tracks", type=int, metavar="N",
+                     help="Show only files with at least N tracks")
+    adv.add_argument("--max-tracks", type=int, metavar="N",
+                     help="Show only files with at most N tracks")
+    adv.add_argument("--min-note", type=_parse_note, metavar="NOTE",
+                     help=("Show only files whose lowest note >= NOTE "
+                           "(MIDI 0-127 or name, e.g. C4, D#3)"))
+    adv.add_argument("--max-note", type=_parse_note, metavar="NOTE",
+                     help=("Show only files whose highest note <= NOTE "
+                           "(MIDI 0-127 or name, e.g. G9, Bb5)"))
+    adv.add_argument("--min-velocity", type=int, metavar="N",
+                     help="Show only files whose minimum note velocity >= N (1-127)")
+    adv.add_argument("--max-velocity", type=int, metavar="N",
+                     help="Show only files whose maximum note velocity <= N (1-127)")
+    adv.add_argument("--min-polyphony", type=int, metavar="N",
+                     help="Show only files with a global peak polyphony >= N")
+    adv.add_argument("--max-polyphony", type=int, metavar="N",
+                     help="Show only files with a global peak polyphony <= N")
+    adv.add_argument("--min-tempo", type=float, metavar="BPM",
+                     help="Show only files whose tempo range reaches at least BPM")
+    adv.add_argument("--max-tempo", type=float, metavar="BPM",
+                     help="Show only files whose tempo range includes at most BPM")
+    adv.add_argument("--has-cc", dest="has_cc", action="append", type=int, metavar="CC",
+                     help=("Show only files that use CC number CC (0-127); "
+                           "may be repeated — all listed CCs must be present"))
+    adv.add_argument("--has-poly-aftertouch", action="store_true",
+                     help="Show only files that use polyphonic aftertouch")
+    adv.add_argument("--no-poly-aftertouch", action="store_true",
+                     help="Show only files that do NOT use polyphonic aftertouch")
+    adv.add_argument("--has-channel-aftertouch", action="store_true",
+                     help="Show only files that use channel aftertouch")
+    adv.add_argument("--no-channel-aftertouch", action="store_true",
+                     help="Show only files that do NOT use channel aftertouch")
+    adv.add_argument("--search", metavar="TEXT",
+                     help=("Show only files containing TEXT in any text event, "
+                           "track name, or metadata (case-insensitive substring)"))
+    adv.add_argument("--has-sysex", metavar="HEX",
+                     help=("Show only files containing a SysEx message that includes "
+                           "these bytes (space-separated hex, e.g. '41 10 42')"))
+    adv.add_argument("--sc-version", dest="sc_versions", action="append",
+                     choices=["SC-55", "SC-88", "SC-88Pro", "SC-8850"],
+                     metavar="VERSION",
+                     help=("Show only GS files requiring this minimum Sound Canvas version; "
+                           "may be repeated for OR logic "
+                           "(choices: SC-55, SC-88, SC-88Pro, SC-8850)"))
+    adv.add_argument("--xg-level", dest="xg_levels", action="append", type=int,
+                     choices=[1, 2, 3],
+                     metavar="LEVEL",
+                     help=("Show only XG files requiring this minimum XG level; "
+                           "may be repeated for OR logic (choices: 1, 2, 3)"))
+
     args = parser.parse_args()
 
     if args.paths_only and args.json:
@@ -2557,6 +3052,68 @@ Examples:
                 file=sys.stderr,
             )
             sys.exit(1)
+
+    # Validate advanced filter arguments.
+    if args.has_poly_aftertouch and args.no_poly_aftertouch:
+        print("Error: --has-poly-aftertouch and --no-poly-aftertouch are mutually exclusive",
+              file=sys.stderr)
+        sys.exit(1)
+    if args.has_channel_aftertouch and args.no_channel_aftertouch:
+        print("Error: --has-channel-aftertouch and --no-channel-aftertouch are mutually exclusive",
+              file=sys.stderr)
+        sys.exit(1)
+    for cc in (args.has_cc or []):
+        if not (0 <= cc <= 127):
+            print(f"Error: --has-cc value must be 0-127, got {cc}", file=sys.stderr)
+            sys.exit(1)
+    for val, flag in [(args.min_velocity, '--min-velocity'),
+                      (args.max_velocity, '--max-velocity')]:
+        if val is not None and not (1 <= val <= 127):
+            print(f"Error: {flag} must be 1-127, got {val}", file=sys.stderr)
+            sys.exit(1)
+    _range_checks = [
+        (args.min_duration,  args.max_duration,  '--min-duration',  '--max-duration'),
+        (args.min_tracks,    args.max_tracks,     '--min-tracks',    '--max-tracks'),
+        (args.min_note,      args.max_note,       '--min-note',      '--max-note'),
+        (args.min_velocity,  args.max_velocity,   '--min-velocity',  '--max-velocity'),
+        (args.min_polyphony, args.max_polyphony,  '--min-polyphony', '--max-polyphony'),
+        (args.min_tempo,     args.max_tempo,      '--min-tempo',     '--max-tempo'),
+    ]
+    for lo, hi, lo_flag, hi_flag in _range_checks:
+        if lo is not None and hi is not None and lo > hi:
+            print(f"Error: {lo_flag} must be <= {hi_flag}", file=sys.stderr)
+            sys.exit(1)
+
+    # Build advanced filter dict (empty if no advanced filter args were provided).
+    advanced_filter = {}
+    if args.min_duration  is not None: advanced_filter['min_duration']  = args.min_duration
+    if args.max_duration  is not None: advanced_filter['max_duration']  = args.max_duration
+    if args.format_type   is not None: advanced_filter['formats']       = {args.format_type}
+    if args.timing_type   is not None: advanced_filter['timing_type']   = args.timing_type
+    if args.time_sig      is not None: advanced_filter['time_signature'] = args.time_sig
+    if args.key_sigs:                   advanced_filter['key_signatures'] = set(args.key_sigs)
+    if args.min_tracks    is not None: advanced_filter['min_tracks']    = args.min_tracks
+    if args.max_tracks    is not None: advanced_filter['max_tracks']    = args.max_tracks
+    if args.min_note      is not None: advanced_filter['min_note']      = args.min_note
+    if args.max_note      is not None: advanced_filter['max_note']      = args.max_note
+    if args.min_velocity  is not None: advanced_filter['min_velocity']  = args.min_velocity
+    if args.max_velocity  is not None: advanced_filter['max_velocity']  = args.max_velocity
+    if args.min_polyphony is not None: advanced_filter['min_polyphony'] = args.min_polyphony
+    if args.max_polyphony is not None: advanced_filter['max_polyphony'] = args.max_polyphony
+    if args.min_tempo     is not None: advanced_filter['min_tempo']     = args.min_tempo
+    if args.max_tempo     is not None: advanced_filter['max_tempo']     = args.max_tempo
+    if args.has_cc:                    advanced_filter['cc_numbers']    = set(args.has_cc)
+    if args.has_poly_aftertouch:       advanced_filter['poly_aftertouch']    = True
+    elif args.no_poly_aftertouch:      advanced_filter['poly_aftertouch']    = False
+    if args.has_channel_aftertouch:    advanced_filter['channel_aftertouch'] = True
+    elif args.no_channel_aftertouch:   advanced_filter['channel_aftertouch'] = False
+    if args.search:                    advanced_filter['search_text']   = args.search
+    if args.has_sysex:                 advanced_filter['sysex_pattern'] = args.has_sysex
+    _SC_TO_GEN = {"SC-55": 1, "SC-88": 2, "SC-88Pro": 3, "SC-8850": 4}
+    if args.sc_versions:
+        advanced_filter['sc_versions'] = {_SC_TO_GEN[v] for v in args.sc_versions}
+    if args.xg_levels:
+        advanced_filter['xg_levels'] = set(args.xg_levels)
 
     # Expand directories into individual MIDI file paths.
     expanded_paths = []
@@ -2587,6 +3144,10 @@ Examples:
 
         if (filters or excludes) and not _file_matches_filters(results, filters, excludes):
             continue
+
+        if advanced_filter:
+            if not _matches_advanced_filters(_filter_summary(results), advanced_filter):
+                continue
 
         if args.paths_only:
             print(filepath)

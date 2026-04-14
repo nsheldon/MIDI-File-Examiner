@@ -14,10 +14,12 @@ from collections import deque
 try:
     from PyQt6.QtWidgets import (
         QApplication, QMainWindow, QWidget,
-        QVBoxLayout, QHBoxLayout,
+        QVBoxLayout, QHBoxLayout, QFormLayout,
         QPushButton, QCheckBox, QGroupBox, QLabel, QLineEdit,
         QTextEdit, QFileDialog, QTabWidget, QMenu,
         QListWidget, QListWidgetItem, QSplitter,
+        QDialog, QDialogButtonBox, QScrollArea,
+        QSpinBox, QDoubleSpinBox, QComboBox, QProgressBar,
     )
     from PyQt6.QtGui import (QFont, QKeySequence, QAction,
                               QDragEnterEvent, QDropEvent,
@@ -31,7 +33,11 @@ except ImportError:
 # midi_examiner and midi_patches_db can always be found.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from midi_examiner import __version__, analyze_midi_file, print_results, collect_midi_files
+from midi_examiner import (
+    __version__, analyze_midi_file, print_results, collect_midi_files,
+    _filter_summary, _matches_advanced_filters, _midi_note_name,
+    _TIME_SIG_VALID_DENOMS, _KEY_SIGNATURES, _key_display_name,
+)
 
 # Mapping from ALL-CAPS section titles (as printed) to shorter tab labels.
 _TAB_LABELS = {
@@ -643,8 +649,9 @@ def _split_sections(text):
 class AnalysisWorker(QThread):
     """Run MIDI analysis in a background thread to keep the UI responsive."""
 
-    # emits (formatted text, detected_standard or "", has_warnings, standard_assumed, is_karaoke)
-    finished = pyqtSignal(str, str, bool, bool, bool)
+    # emits (formatted text, detected_standard or "", has_warnings, standard_assumed,
+    #        is_karaoke, filter_summary_dict)
+    finished = pyqtSignal(str, str, bool, bool, bool, object)
     error = pyqtSignal(str)
 
     def __init__(self, filepath):
@@ -657,11 +664,13 @@ class AnalysisWorker(QThread):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 print_results(results)
-            standard = results.get("detected_standard") or ""
+            standard    = results.get("detected_standard") or ""
             has_warnings = bool(results.get("warnings"))
-            assumed = bool(results.get("standard_assumed"))
-            is_karaoke = bool(results.get("karaoke"))
-            self.finished.emit(output.getvalue(), standard, has_warnings, assumed, is_karaoke)
+            assumed     = bool(results.get("standard_assumed"))
+            is_karaoke  = bool(results.get("karaoke"))
+            fsum        = _filter_summary(results)
+            self.finished.emit(output.getvalue(), standard, has_warnings, assumed,
+                               is_karaoke, fsum)
         except Exception as e:
             self.error.emit(str(e))
 
@@ -728,6 +737,575 @@ def _apply_appearance(app):
         app.setPalette(app.style().standardPalette())
 
 
+def _hrow(*widgets):
+    """Return a QWidget that lays out *widgets* horizontally with tight margins."""
+    w = QWidget()
+    h = QHBoxLayout(w)
+    h.setContentsMargins(0, 0, 0, 0)
+    h.setSpacing(4)
+    for widget in widgets:
+        h.addWidget(widget)
+    h.addStretch()
+    return w
+
+
+class _DenomSpinBox(QSpinBox):
+    """QSpinBox for MIDI time signature denominators.
+
+    Arrow keys and the scroll wheel step through the valid values only
+    (0 = no constraint, then 1, 2, 4, 8, 16, 32, 64, 128).  Free-text
+    entry is accepted; get_filters() ignores the value if it is not a
+    valid power of 2.
+    """
+
+    _STEPS = [0, 1, 2, 4, 8, 16, 32, 64, 128]
+
+    def stepBy(self, steps):
+        cur = self.value()
+        vals = self._STEPS
+        try:
+            idx = vals.index(cur)
+        except ValueError:
+            # Snap to the nearest step before moving.
+            idx = min(range(len(vals)), key=lambda i: abs(vals[i] - cur))
+        self.setValue(vals[max(0, min(len(vals) - 1, idx + steps))])
+
+
+class AdvancedFilterDialog(QDialog):
+    """Modal dialog for configuring advanced MIDI file filter conditions.
+
+    Presents filter controls in four sections:
+        File Info         – duration, MIDI format type, track count
+        Notes & Velocity  – note range, velocity range, peak polyphony, key signature
+        Timing & Events   – timing type, time signature, tempo range, CC numbers, aftertouch
+        Search            – text search, SysEx hex pattern
+
+    Fields use a sentinel value (—) to indicate "no constraint".  Only fields
+    with a non-sentinel value contribute to the returned filter dict.
+
+    Call get_filters() after exec() returns QDialog.Accepted.
+    """
+
+    def __init__(self, current_filters, *, gs_active=False, xg_active=False, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Advanced Filter")
+        self.setModal(True)
+        self.setMinimumWidth(480)
+        self._gs_active = gs_active
+        self._xg_active = xg_active
+        self._build_ui()
+        self._load_filters(current_filters or {})
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(6)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        content = QWidget()
+        vbox = QVBoxLayout(content)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(8)
+
+        small_font = self.font()
+        small_font.setPointSize(max(8, small_font.pointSize() - 1))
+
+        # ── File Info ─────────────────────────────────────────────────────────
+        fi_grp  = QGroupBox("File Info")
+        fi_form = QFormLayout(fi_grp)
+        fi_form.setSpacing(4)
+        fi_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self._dur_min = QDoubleSpinBox()
+        self._dur_min.setRange(0.0, 86400.0)
+        self._dur_min.setDecimals(1)
+        self._dur_min.setSuffix(" s")
+        self._dur_min.setSpecialValueText("—")
+        self._dur_min.setToolTip("Minimum duration in seconds (— = no limit)")
+
+        self._dur_max = QDoubleSpinBox()
+        self._dur_max.setRange(0.0, 86400.0)
+        self._dur_max.setDecimals(1)
+        self._dur_max.setSuffix(" s")
+        self._dur_max.setSpecialValueText("—")
+        self._dur_max.setToolTip("Maximum duration in seconds (— = no limit)")
+
+        fi_form.addRow("Duration:",
+                       _hrow(QLabel("min"), self._dur_min, QLabel("max"), self._dur_max))
+
+        fmt_row = QWidget()
+        fmt_hbox = QHBoxLayout(fmt_row)
+        fmt_hbox.setContentsMargins(0, 0, 0, 0)
+        fmt_hbox.setSpacing(8)
+        self._fmt_checks = {}
+        for i in range(3):
+            cb = QCheckBox(f"Type {i}")
+            cb.setFont(small_font)
+            cb.setToolTip(f"Include only MIDI format type {i} files")
+            self._fmt_checks[i] = cb
+            fmt_hbox.addWidget(cb)
+        fmt_hbox.addStretch()
+        fi_form.addRow("Format:", fmt_row)
+
+        self._trk_min = QSpinBox()
+        self._trk_min.setRange(-1, 9999)
+        self._trk_min.setSpecialValueText("—")
+        self._trk_min.setToolTip("Minimum track count (— = no limit)")
+
+        self._trk_max = QSpinBox()
+        self._trk_max.setRange(-1, 9999)
+        self._trk_max.setSpecialValueText("—")
+        self._trk_max.setToolTip("Maximum track count (— = no limit)")
+
+        fi_form.addRow("Tracks:",
+                       _hrow(QLabel("min"), self._trk_min, QLabel("max"), self._trk_max))
+
+        # Roland SC minimum version (OR logic — any checked generation matches)
+        sc_row = QWidget()
+        sc_hbox = QHBoxLayout(sc_row)
+        sc_hbox.setContentsMargins(0, 0, 0, 0)
+        sc_hbox.setSpacing(6)
+        self._sc_checks = {}
+        for gen, label in [(1, "SC-55"), (2, "SC-88"), (3, "SC-88Pro"), (4, "SC-8850")]:
+            cb = QCheckBox(label)
+            cb.setFont(small_font)
+            cb.setToolTip(
+                f"Show GS files whose minimum required Sound Canvas is the {label}")
+            self._sc_checks[gen] = cb
+            sc_hbox.addWidget(cb)
+        sc_hbox.addStretch()
+        fi_form.addRow("Roland SC req.:", sc_row)
+
+        # Yamaha XG minimum level (OR logic — any checked level matches)
+        xg_row = QWidget()
+        xg_hbox = QHBoxLayout(xg_row)
+        xg_hbox.setContentsMargins(0, 0, 0, 0)
+        xg_hbox.setSpacing(6)
+        self._xg_checks = {}
+        for lvl, label, device in [
+            (1, "Level 1", "MU50/MU80/MU90"),
+            (2, "Level 2", "MU100"),
+            (3, "Level 3", "MU128"),
+        ]:
+            cb = QCheckBox(label)
+            cb.setFont(small_font)
+            cb.setToolTip(
+                f"Show XG files whose minimum required device is {device} (XG {label})")
+            self._xg_checks[lvl] = cb
+            xg_hbox.addWidget(cb)
+        xg_hbox.addStretch()
+        fi_form.addRow("Yamaha XG level:", xg_row)
+
+        vbox.addWidget(fi_grp)
+
+        # ── Notes & Velocity ──────────────────────────────────────────────────
+        note_grp  = QGroupBox("Notes && Velocity")
+        note_form = QFormLayout(note_grp)
+        note_form.setSpacing(4)
+        note_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self._note_min = QSpinBox()
+        self._note_min.setRange(-1, 127)
+        self._note_min.setSpecialValueText("—")
+        self._note_min.setToolTip(
+            "File's lowest note must be \u2265 this value (— = no limit)\n"
+            "MIDI 0 (C\u22121) to 127 (G9); file doesn't go below this note")
+
+        self._note_min_lbl = QLabel("")
+        self._note_min_lbl.setFont(small_font)
+        self._note_min_lbl.setMinimumWidth(30)
+        self._note_min.valueChanged.connect(self._refresh_note_labels)
+
+        self._note_max = QSpinBox()
+        self._note_max.setRange(-1, 127)
+        self._note_max.setSpecialValueText("—")
+        self._note_max.setToolTip(
+            "File's highest note must be \u2264 this value (— = no limit)\n"
+            "File doesn't go above this note")
+
+        self._note_max_lbl = QLabel("")
+        self._note_max_lbl.setFont(small_font)
+        self._note_max_lbl.setMinimumWidth(30)
+        self._note_max.valueChanged.connect(self._refresh_note_labels)
+
+        note_form.addRow("Note range:",
+                         _hrow(QLabel("min"), self._note_min, self._note_min_lbl,
+                               QLabel("max"), self._note_max, self._note_max_lbl))
+
+        self._vel_min = QSpinBox()
+        self._vel_min.setRange(-1, 127)
+        self._vel_min.setSpecialValueText("—")
+        self._vel_min.setToolTip(
+            "File's lowest velocity must be \u2265 this value (— = no limit)")
+
+        self._vel_max = QSpinBox()
+        self._vel_max.setRange(-1, 127)
+        self._vel_max.setSpecialValueText("—")
+        self._vel_max.setToolTip(
+            "File's highest velocity must be \u2264 this value (— = no limit)")
+
+        note_form.addRow("Velocity:",
+                         _hrow(QLabel("min"), self._vel_min, QLabel("max"), self._vel_max))
+
+        self._poly_min = QSpinBox()
+        self._poly_min.setRange(-1, 9999)
+        self._poly_min.setSpecialValueText("—")
+        self._poly_min.setToolTip(
+            "File's global peak polyphony must be \u2265 this value (— = no limit)")
+
+        self._poly_max = QSpinBox()
+        self._poly_max.setRange(-1, 9999)
+        self._poly_max.setSpecialValueText("—")
+        self._poly_max.setToolTip(
+            "File's global peak polyphony must be \u2264 this value (— = no limit)")
+
+        note_form.addRow("Peak polyphony:",
+                         _hrow(QLabel("min"), self._poly_min, QLabel("max"), self._poly_max))
+
+        self._key_sig_list = QListWidget()
+        self._key_sig_list.setSelectionMode(
+            QListWidget.SelectionMode.NoSelection)
+        self._key_sig_list.setToolTip(
+            "Check one or more key signatures to show only files that match "
+            "(OR logic). Leave all unchecked for no constraint.")
+        self._key_sig_list.setMaximumHeight(112)  # ~5 rows visible; rest scrollable
+        for ks in _KEY_SIGNATURES:
+            item = QListWidgetItem(_key_display_name(ks))
+            item.setData(Qt.ItemDataRole.UserRole, ks)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self._key_sig_list.addItem(item)
+        note_form.addRow("Key signature:", self._key_sig_list)
+
+        vbox.addWidget(note_grp)
+
+        # ── Timing & Events ───────────────────────────────────────────────────
+        evt_grp  = QGroupBox("Timing && Events")
+        evt_form = QFormLayout(evt_grp)
+        evt_form.setSpacing(4)
+        evt_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        # Timing type pop-up (Any / PPQ / SMPTE).
+        self._timing_type_combo = QComboBox()
+        self._timing_type_combo.addItems(
+            ["Any", "PPQ — tempo-based timing", "SMPTE — frame-based timing"])
+        self._timing_type_combo.setToolTip("Filter by MIDI timing type")
+        evt_form.addRow("Timing type:", self._timing_type_combo)
+
+        # Time signature: two spinboxes with a "/" label between them.
+        self._timesig_num = QSpinBox()
+        self._timesig_num.setRange(0, 255)
+        self._timesig_num.setSpecialValueText("—")
+        self._timesig_num.setToolTip("Numerator (1\u2013255; — = no constraint)")
+        self._timesig_num.setMaximumWidth(54)
+
+        self._timesig_denom = _DenomSpinBox()
+        self._timesig_denom.setRange(0, 128)
+        self._timesig_denom.setSpecialValueText("—")
+        self._timesig_denom.setToolTip(
+            "Denominator — must be a power of 2 (1, 2, 4, 8, 16, 32, 64, 128)\n"
+            "Arrow keys step through valid values only; — = no constraint")
+        self._timesig_denom.setMaximumWidth(54)
+
+        evt_form.addRow("Time signature:",
+                        _hrow(self._timesig_num, QLabel("/"), self._timesig_denom))
+
+        self._tempo_min = QDoubleSpinBox()
+        self._tempo_min.setRange(0.0, 9999.0)
+        self._tempo_min.setDecimals(1)
+        self._tempo_min.setSuffix(" BPM")
+        self._tempo_min.setSpecialValueText("—")
+        self._tempo_min.setToolTip(
+            "File's tempo range must reach at least this BPM (— = no limit)")
+
+        self._tempo_max = QDoubleSpinBox()
+        self._tempo_max.setRange(0.0, 9999.0)
+        self._tempo_max.setDecimals(1)
+        self._tempo_max.setSuffix(" BPM")
+        self._tempo_max.setSpecialValueText("—")
+        self._tempo_max.setToolTip(
+            "File's tempo range must include at most this BPM (— = no limit)")
+
+        evt_form.addRow("Tempo:",
+                        _hrow(QLabel("min"), self._tempo_min, QLabel("max"), self._tempo_max))
+
+        self._cc_edit = QLineEdit()
+        self._cc_edit.setPlaceholderText("e.g. 7, 10, 64")
+        self._cc_edit.setToolTip(
+            "Comma-separated CC numbers (0-127)\n"
+            "File must use ALL listed CCs (AND logic)")
+        evt_form.addRow("CC numbers:", self._cc_edit)
+
+        self._poly_at_combo = QComboBox()
+        self._poly_at_combo.addItems(
+            ["Any", "Yes — file uses poly AT", "No — file has no poly AT"])
+        self._poly_at_combo.setToolTip("Filter by polyphonic (per-note) aftertouch usage")
+        evt_form.addRow("Poly aftertouch:", self._poly_at_combo)
+
+        self._ch_at_combo = QComboBox()
+        self._ch_at_combo.addItems(
+            ["Any", "Yes — file uses channel AT", "No — file has no channel AT"])
+        self._ch_at_combo.setToolTip("Filter by channel aftertouch usage")
+        evt_form.addRow("Channel aftertouch:", self._ch_at_combo)
+
+        vbox.addWidget(evt_grp)
+
+        # ── Search ────────────────────────────────────────────────────────────
+        search_grp  = QGroupBox("Search")
+        search_form = QFormLayout(search_grp)
+        search_form.setSpacing(4)
+        search_form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
+
+        self._text_search = QLineEdit()
+        self._text_search.setPlaceholderText(
+            "Substring in text events, track names, metadata…")
+        self._text_search.setToolTip("Case-insensitive substring search across all text")
+        search_form.addRow("Text:", self._text_search)
+
+        self._sysex_search = QLineEdit()
+        self._sysex_search.setPlaceholderText("e.g. 41 10 42  (hex bytes, spaces optional)")
+        self._sysex_search.setToolTip(
+            "Hex byte sequence that must appear in at least one SysEx message\n"
+            "Spaces are ignored: '411042' and '41 10 42' are equivalent")
+        search_form.addRow("SysEx pattern:", self._sysex_search)
+
+        vbox.addWidget(search_grp)
+        vbox.addStretch()
+
+        scroll.setWidget(content)
+        outer.addWidget(scroll)
+
+        # Button row
+        btn_row = QHBoxLayout()
+        clear_btn = QPushButton("Reset")
+        clear_btn.setToolTip("Reset all fields to no constraint")
+        clear_btn.clicked.connect(self._clear_all)
+        btn_row.addWidget(clear_btn)
+        btn_row.addStretch()
+        std_btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok |
+            QDialogButtonBox.StandardButton.Cancel)
+        std_btns.accepted.connect(self.accept)
+        std_btns.rejected.connect(self.reject)
+        btn_row.addWidget(std_btns)
+        outer.addLayout(btn_row)
+
+    # ── State load / save ─────────────────────────────────────────────────────
+
+    def _load_filters(self, f):
+        """Populate UI widgets from filter dict *f*."""
+        self._dur_min.setValue(f.get('min_duration', 0.0))
+        self._dur_max.setValue(f.get('max_duration', 0.0))
+        fmts = f.get('formats', set())
+        for i, cb in self._fmt_checks.items():
+            cb.setChecked(i in fmts)
+        self._trk_min.setValue(f.get('min_tracks', -1))
+        self._trk_max.setValue(f.get('max_tracks', -1))
+        self._note_min.setValue(f.get('min_note', -1))
+        self._note_max.setValue(f.get('max_note', -1))
+        self._refresh_note_labels()
+        self._vel_min.setValue(f.get('min_velocity', -1))
+        self._vel_max.setValue(f.get('max_velocity', -1))
+        self._poly_min.setValue(f.get('min_polyphony', -1))
+        self._poly_max.setValue(f.get('max_polyphony', -1))
+        ks_active = f.get('key_signatures', set())
+        for i in range(self._key_sig_list.count()):
+            item = self._key_sig_list.item(i)
+            item.setCheckState(
+                Qt.CheckState.Checked
+                if item.data(Qt.ItemDataRole.UserRole) in ks_active
+                else Qt.CheckState.Unchecked
+            )
+        tt = f.get('timing_type')
+        self._timing_type_combo.setCurrentIndex(
+            0 if tt is None else (1 if tt == 'PPQ' else 2))
+        ts = f.get('time_signature')
+        self._timesig_num.setValue(ts[0] if ts else 0)
+        self._timesig_denom.setValue(ts[1] if ts else 0)
+        self._tempo_min.setValue(f.get('min_tempo', 0.0))
+        self._tempo_max.setValue(f.get('max_tempo', 0.0))
+        cc_nums = f.get('cc_numbers', set())
+        self._cc_edit.setText(
+            ', '.join(str(c) for c in sorted(cc_nums)) if cc_nums else '')
+        pat = f.get('poly_aftertouch')
+        self._poly_at_combo.setCurrentIndex(
+            0 if pat is None else (1 if pat else 2))
+        cat = f.get('channel_aftertouch')
+        self._ch_at_combo.setCurrentIndex(
+            0 if cat is None else (1 if cat else 2))
+        self._text_search.setText(f.get('search_text', ''))
+        self._sysex_search.setText(f.get('sysex_pattern', ''))
+        # When the key is absent (never modified), default to all checked only if
+        # the corresponding standard is active in the main filter; otherwise default
+        # to none checked so unrelated sub-options don't appear pre-selected.
+        all_sc = set(self._sc_checks)
+        sc_default = all_sc if self._gs_active else set()
+        sc_versions = f.get('sc_versions', sc_default)
+        for gen, cb in self._sc_checks.items():
+            cb.setChecked(gen in sc_versions)
+        all_xg = set(self._xg_checks)
+        xg_default = all_xg if self._xg_active else set()
+        xg_levels = f.get('xg_levels', xg_default)
+        for lvl, cb in self._xg_checks.items():
+            cb.setChecked(lvl in xg_levels)
+
+    def get_filters(self):
+        """Return the current filter state as a dict for _matches_advanced_filters."""
+        adv = {}
+
+        v = self._dur_min.value()
+        if v > 0.0:
+            adv['min_duration'] = v
+        v = self._dur_max.value()
+        if v > 0.0:
+            adv['max_duration'] = v
+
+        fmts = {i for i, cb in self._fmt_checks.items() if cb.isChecked()}
+        if fmts:
+            adv['formats'] = fmts
+
+        v = self._trk_min.value()
+        if v >= 0:
+            adv['min_tracks'] = v
+        v = self._trk_max.value()
+        if v >= 0:
+            adv['max_tracks'] = v
+
+        v = self._note_min.value()
+        if v >= 0:
+            adv['min_note'] = v
+        v = self._note_max.value()
+        if v >= 0:
+            adv['max_note'] = v
+
+        v = self._vel_min.value()
+        if v >= 0:
+            adv['min_velocity'] = v
+        v = self._vel_max.value()
+        if v >= 0:
+            adv['max_velocity'] = v
+
+        v = self._poly_min.value()
+        if v >= 0:
+            adv['min_polyphony'] = v
+        v = self._poly_max.value()
+        if v >= 0:
+            adv['max_polyphony'] = v
+
+        ks_sel = {
+            self._key_sig_list.item(i).data(Qt.ItemDataRole.UserRole)
+            for i in range(self._key_sig_list.count())
+            if self._key_sig_list.item(i).checkState() == Qt.CheckState.Checked
+        }
+        if ks_sel:
+            adv['key_signatures'] = ks_sel
+
+        tt_idx = self._timing_type_combo.currentIndex()
+        if tt_idx == 1:
+            adv['timing_type'] = 'PPQ'
+        elif tt_idx == 2:
+            adv['timing_type'] = 'SMPTE'
+
+        ts_num   = self._timesig_num.value()
+        ts_denom = self._timesig_denom.value()
+        if ts_num > 0 and ts_denom in _TIME_SIG_VALID_DENOMS:
+            adv['time_signature'] = (ts_num, ts_denom)
+
+        v = self._tempo_min.value()
+        if v > 0.0:
+            adv['min_tempo'] = v
+        v = self._tempo_max.value()
+        if v > 0.0:
+            adv['max_tempo'] = v
+
+        cc_text = self._cc_edit.text().strip()
+        if cc_text:
+            cc_nums = set()
+            for tok in cc_text.replace(',', ' ').split():
+                try:
+                    n = int(tok)
+                    if 0 <= n <= 127:
+                        cc_nums.add(n)
+                except ValueError:
+                    pass
+            if cc_nums:
+                adv['cc_numbers'] = cc_nums
+
+        idx = self._poly_at_combo.currentIndex()
+        if idx == 1:
+            adv['poly_aftertouch'] = True
+        elif idx == 2:
+            adv['poly_aftertouch'] = False
+
+        idx = self._ch_at_combo.currentIndex()
+        if idx == 1:
+            adv['channel_aftertouch'] = True
+        elif idx == 2:
+            adv['channel_aftertouch'] = False
+
+        t = self._text_search.text().strip()
+        if t:
+            adv['search_text'] = t
+        s = self._sysex_search.text().strip()
+        if s:
+            adv['sysex_pattern'] = s
+
+        # Only store sc_versions/xg_levels when the selection is a strict subset
+        # (all options checked = no constraint, same as none checked).
+        sc_versions = {gen for gen, cb in self._sc_checks.items() if cb.isChecked()}
+        if sc_versions and sc_versions != set(self._sc_checks):
+            adv['sc_versions'] = sc_versions
+        xg_levels = {lvl for lvl, cb in self._xg_checks.items() if cb.isChecked()}
+        if xg_levels and xg_levels != set(self._xg_checks):
+            adv['xg_levels'] = xg_levels
+
+        return adv
+
+    def _clear_all(self):
+        """Reset all filter fields to the no-constraint state."""
+        self._dur_min.setValue(0.0)
+        self._dur_max.setValue(0.0)
+        for cb in self._fmt_checks.values():
+            cb.setChecked(False)
+        self._trk_min.setValue(-1)
+        self._trk_max.setValue(-1)
+        self._note_min.setValue(-1)
+        self._note_max.setValue(-1)
+        self._vel_min.setValue(-1)
+        self._vel_max.setValue(-1)
+        self._poly_min.setValue(-1)
+        self._poly_max.setValue(-1)
+        for i in range(self._key_sig_list.count()):
+            self._key_sig_list.item(i).setCheckState(Qt.CheckState.Unchecked)
+        self._timing_type_combo.setCurrentIndex(0)
+        self._timesig_num.setValue(0)
+        self._timesig_denom.setValue(0)
+        self._tempo_min.setValue(0.0)
+        self._tempo_max.setValue(0.0)
+        self._cc_edit.clear()
+        self._poly_at_combo.setCurrentIndex(0)
+        self._ch_at_combo.setCurrentIndex(0)
+        self._text_search.clear()
+        self._sysex_search.clear()
+        # Reset to all-checked (no constraint) when the standard is active;
+        # otherwise reset to none-checked so unrelated options stay clear.
+        for cb in self._sc_checks.values():
+            cb.setChecked(self._gs_active)
+        for cb in self._xg_checks.values():
+            cb.setChecked(self._xg_active)
+
+    def _refresh_note_labels(self):
+        """Update the note-name labels next to the note range spinboxes."""
+        v = self._note_min.value()
+        self._note_min_lbl.setText(_midi_note_name(v) if v >= 0 else "")
+        v = self._note_max.value()
+        self._note_max_lbl.setText(_midi_note_name(v) if v >= 0 else "")
+
+
 class MidiApplication(QApplication):
     """QApplication subclass that handles macOS file-open Apple Events.
 
@@ -785,8 +1363,9 @@ class MidiExaminerWindow(QMainWindow):
         self._pending_paths = deque()  # analysis queue (FIFO)
         self._pending_set = set()      # O(1) membership test for _pending_paths
         self._sidebar_items = {}   # path -> QListWidgetItem (O(1) lookup)
-        self._file_tags = {}       # path -> {standard, has_warnings, assumed, is_karaoke}
-        self._folder_count = 0     # number of folder-header rows in the sidebar
+        self._file_tags = {}           # path -> {standard, has_warnings, assumed, is_karaoke, ...}
+        self._advanced_filters = {}    # advanced filter state (see AdvancedFilterDialog)
+        self._folder_count = 0         # number of folder-header rows in the sidebar
         self._visible_count = 0    # number of visible (non-hidden) file items
         self._active_worker_path = None
         # Keeps the last 2 retired AnalysisWorker Python wrappers alive after
@@ -797,6 +1376,8 @@ class MidiExaminerWindow(QMainWindow):
         # By the time an entry is pushed out of this deque (when the NEXT
         # worker finishes), the earlier thread has long since truly exited.
         self._retired_workers = deque(maxlen=2)
+        self._total_files = 0      # files added in the current batch
+        self._completed_files = 0  # files finished (done or error) in current batch
 
         self._build_menu()
         self._build_ui()
@@ -889,6 +1470,10 @@ class MidiExaminerWindow(QMainWindow):
             cb.stateChanged.connect(self._on_filter_changed)
             self._standard_checks[key] = cb
             standard_row.addWidget(cb)
+        # When GS or XG is unchecked, clear the corresponding advanced filter
+        # entries so the two filter panels stay consistent.
+        self._standard_checks['GS'].stateChanged.connect(self._on_gs_check_changed)
+        self._standard_checks['XG'].stateChanged.connect(self._on_xg_check_changed)
         standard_row.addStretch()
         filter_vlayout.addLayout(standard_row)
 
@@ -906,6 +1491,18 @@ class MidiExaminerWindow(QMainWindow):
             self._modifier_checks[key] = cb
             modifier_row.addWidget(cb)
         modifier_row.addStretch()
+        self._reset_btn = QPushButton("Reset")
+        self._reset_btn.setFont(filter_font)
+        self._reset_btn.setToolTip("Clear all standard, modifier, and advanced filters")
+        self._reset_btn.clicked.connect(self._reset_all_filters)
+        modifier_row.addWidget(self._reset_btn)
+        self._adv_btn = QPushButton("Advanced\u2026")
+        self._adv_btn.setFont(filter_font)
+        self._adv_btn.setToolTip(
+            "Open the Advanced Filter dialog to filter by duration, note range, "
+            "velocity, tempo, CC usage, text, SysEx, and more")
+        self._adv_btn.clicked.connect(self._open_advanced_filter)
+        modifier_row.addWidget(self._adv_btn)
         filter_vlayout.addLayout(modifier_row)
         sidebar_layout.addWidget(filter_group)
 
@@ -946,6 +1543,13 @@ class MidiExaminerWindow(QMainWindow):
         layout.addWidget(splitter)
 
         self.statusBar().showMessage("Ready — open a MIDI file to begin.")
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setFixedWidth(180)
+        self._progress_bar.setFixedHeight(16)
+        self._progress_bar.setTextVisible(True)
+        self._progress_bar.setFormat("%v / %m")
+        self._progress_bar.setVisible(False)
+        self.statusBar().addPermanentWidget(self._progress_bar)
 
     # ------------------------------------------------------------------
     # File handling
@@ -988,7 +1592,7 @@ class MidiExaminerWindow(QMainWindow):
                 files, warnings = collect_midi_files(path, max_depth=6)
                 all_warnings.extend(warnings)
                 if not files:
-                    all_warnings.append(f"No MIDI files found in: {os.path.basename(path)}")
+                    all_warnings.append(f"No MIDI files found in: {os.path.basename(path.rstrip(os.sep))}")
                 seen_folders = set()
                 first_file = True
                 for f in files:
@@ -1066,6 +1670,14 @@ class MidiExaminerWindow(QMainWindow):
 
         self._pending_paths.append(path)
         self._pending_set.add(path)
+        # Reset progress counters when adding to an otherwise-idle queue, so
+        # a new drag-and-drop batch starts fresh rather than continuing from
+        # a previous run's totals.
+        if self._active_worker_path is None and self._total_files == self._completed_files:
+            self._total_files = 0
+            self._completed_files = 0
+        self._total_files += 1
+        self._update_progress()
         self._start_next_worker()
 
     def _insert_file_sorted(self, item, path):
@@ -1118,12 +1730,14 @@ class MidiExaminerWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _get_active_filters(self):
-        """Return active filter state as (show_standards, show_modifiers, hide_modifiers).
+        """Return active filter state as
+        (show_standards, show_modifiers, hide_modifiers, advanced).
 
         show_standards: frozenset of standard keys checked for OR-inclusion;
             empty means no standard filter (show all standards).
         show_modifiers: frozenset of modifier keys in the checked (show-only) state.
         hide_modifiers: frozenset of modifier keys in the partially-checked (hide) state.
+        advanced: dict of advanced filter conditions (empty = no advanced filter).
         """
         show_standards = frozenset(
             key for key, cb in self._standard_checks.items() if cb.isChecked()
@@ -1136,7 +1750,8 @@ class MidiExaminerWindow(QMainWindow):
                 show_modifiers.add(key)
             elif state == Qt.CheckState.PartiallyChecked:
                 hide_modifiers.add(key)
-        return show_standards, frozenset(show_modifiers), frozenset(hide_modifiers)
+        return (show_standards, frozenset(show_modifiers), frozenset(hide_modifiers),
+                self._advanced_filters)
 
     @staticmethod
     def _make_modifier_cycle_handler(cb):
@@ -1170,6 +1785,56 @@ class MidiExaminerWindow(QMainWindow):
         rapid successive changes collapse into a single O(n) scan.
         """
         self._filter_timer.start()  # (re)starts the 100 ms single-shot timer
+
+    def _open_advanced_filter(self):
+        """Open the Advanced Filter dialog and apply any changes on OK."""
+        dialog = AdvancedFilterDialog(
+            self._advanced_filters,
+            gs_active=self._standard_checks['GS'].isChecked(),
+            xg_active=self._standard_checks['XG'].isChecked(),
+            parent=self,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._advanced_filters = dialog.get_filters()
+            self._update_adv_btn()
+            # Auto-check the GS standard filter if any SC version is selected,
+            # and the XG standard filter if any XG level is selected.
+            if self._advanced_filters.get('sc_versions'):
+                self._standard_checks['GS'].setChecked(True)
+            if self._advanced_filters.get('xg_levels'):
+                self._standard_checks['XG'].setChecked(True)
+            self._on_filter_changed()
+
+    def _reset_all_filters(self):
+        """Clear all standard checkboxes, modifier checkboxes, and advanced filters."""
+        # Block signals while resetting to avoid triggering _on_filter_changed
+        # once per widget; a single call at the end is sufficient.
+        for cb in self._standard_checks.values():
+            cb.blockSignals(True)
+            cb.setChecked(False)
+            cb.blockSignals(False)
+        for cb in self._modifier_checks.values():
+            cb.blockSignals(True)
+            cb.setCheckState(Qt.CheckState.Unchecked)
+            cb.blockSignals(False)
+        self._advanced_filters = {}
+        self._update_adv_btn()
+        self._on_filter_changed()
+
+    def _on_gs_check_changed(self, state):
+        """Clear SC-version advanced filters when the GS standard checkbox is unchecked."""
+        if not state and self._advanced_filters.pop('sc_versions', None):
+            self._update_adv_btn()
+
+    def _on_xg_check_changed(self, state):
+        """Clear XG-level advanced filters when the XG standard checkbox is unchecked."""
+        if not state and self._advanced_filters.pop('xg_levels', None):
+            self._update_adv_btn()
+
+    def _update_adv_btn(self):
+        """Update the Advanced button label to show when advanced filters are active."""
+        self._adv_btn.setText(
+            "Advanced \u25cf" if self._advanced_filters else "Advanced\u2026")
 
     def _apply_sidebar_filter(self):
         """Show or hide sidebar file items based on the active filters.
@@ -1205,8 +1870,8 @@ class MidiExaminerWindow(QMainWindow):
         _visible_count is maintained here so all subsequent
         _update_sidebar_status calls stay O(1).
         """
-        show_standards, show_modifiers, hide_modifiers = self._get_active_filters()
-        has_filter = bool(show_standards or show_modifiers or hide_modifiers)
+        show_standards, show_modifiers, hide_modifiers, advanced = self._get_active_filters()
+        has_filter = bool(show_standards or show_modifiers or hide_modifiers or advanced)
 
         # Pre-clear the selection if the currently selected file item will not
         # survive the new filter.  This must happen before the loop so that
@@ -1220,7 +1885,8 @@ class MidiExaminerWindow(QMainWindow):
                 # Pending items (cur_tags is None) always remain visible.
                 if cur_tags is not None and has_filter \
                         and not self._matches_filters(cur_tags, show_standards,
-                                                      show_modifiers, hide_modifiers):
+                                                      show_modifiers, hide_modifiers,
+                                                      advanced):
                     self.sidebar.clearSelection()
                     self.tab_widget.clear()
                     self.file_path_edit.clear()
@@ -1236,7 +1902,7 @@ class MidiExaminerWindow(QMainWindow):
                 tags = self._file_tags.get(path)
                 show = (tags is None) or (not has_filter) \
                     or self._matches_filters(tags, show_standards,
-                                             show_modifiers, hide_modifiers)
+                                             show_modifiers, hide_modifiers, advanced)
                 if item.isHidden() == show:   # state needs to change
                     item.setHidden(not show)
                 if show:
@@ -1248,13 +1914,15 @@ class MidiExaminerWindow(QMainWindow):
         self._update_sidebar_status()
 
     @staticmethod
-    def _matches_filters(tags, show_standards, show_modifiers, hide_modifiers):
+    def _matches_filters(tags, show_standards, show_modifiers, hide_modifiers,
+                         advanced=None):
         """Return True if *tags* satisfies the active filter state.
 
-        *tags* is the dict stored in _file_tags.
+        *tags* is the dict stored in _file_tags (basic tags merged with filter summary).
         show_standards: OR logic — file must match at least one (empty = no standard filter).
         show_modifiers: AND logic — file must have all listed tags.
         hide_modifiers: file must have none of the listed tags.
+        advanced: optional dict of advanced filter conditions (empty/None = no constraint).
         """
         if show_standards:
             file_std = tags.get('standard', '')
@@ -1282,6 +1950,8 @@ class MidiExaminerWindow(QMainWindow):
                 return False
             if key == 'KAR' and tags.get('is_karaoke'):
                 return False
+        if advanced and not _matches_advanced_filters(tags, advanced):
+            return False
         return True
 
     def _clear_files(self):
@@ -1299,6 +1969,21 @@ class MidiExaminerWindow(QMainWindow):
         self.clear_button.setEnabled(False)
         self.sidebar_status_label.setText("")
         self.statusBar().showMessage("Ready — open a MIDI file to begin.")
+        self._total_files = 0
+        self._completed_files = 0
+        self._progress_bar.setVisible(False)
+
+    def _update_progress(self):
+        """Show or update the status-bar progress bar during multi-file analysis."""
+        if self._total_files < 2:
+            # Single file — no progress bar needed.
+            self._progress_bar.setVisible(False)
+            return
+        self._progress_bar.setMaximum(self._total_files)
+        self._progress_bar.setValue(self._completed_files)
+        self._progress_bar.setVisible(True)
+        if self._completed_files >= self._total_files:
+            self._progress_bar.setVisible(False)
 
     def _start_next_worker(self):
         if self._active_worker_path is not None or not self._pending_paths:
@@ -1326,7 +2011,7 @@ class MidiExaminerWindow(QMainWindow):
         self.worker = worker
         worker.start()
 
-    def _on_analysis_done(self, text, standard, has_warnings, assumed, is_karaoke):
+    def _on_analysis_done(self, text, standard, has_warnings, assumed, is_karaoke, fsum):
         path = self._active_worker_path
         self._active_worker_path = None
         # Use _sidebar_items (O(1) dict) instead of _file_order (O(n) list) to
@@ -1340,12 +2025,14 @@ class MidiExaminerWindow(QMainWindow):
         # viewed so that the main thread is not blocked parsing every file's
         # output up-front during a large batch analysis.
         self._file_sections[path] = text
-        # Store per-file tags so the sidebar filter can evaluate this file.
+        # Store per-file tags merged with the filter summary so both basic and
+        # advanced filters can evaluate this file with O(1) dict lookups.
         self._file_tags[path] = {
-            'standard': standard,
+            'standard':     standard,
             'has_warnings': has_warnings,
-            'assumed': assumed,
-            'is_karaoke': is_karaoke,
+            'assumed':      assumed,
+            'is_karaoke':   is_karaoke,
+            **fsum,
         }
         # Color and tag the sidebar item for this file — O(1) via dict.
         item = self._sidebar_items.get(path)
@@ -1358,11 +2045,13 @@ class MidiExaminerWindow(QMainWindow):
             # If this item is currently selected, clear the selection before
             # hiding it — same pre-clear pattern as _apply_sidebar_filter —
             # to prevent the currentItemChanged auto-select cascade.
-            show_standards, show_modifiers, hide_modifiers = self._get_active_filters()
-            has_filter = bool(show_standards or show_modifiers or hide_modifiers)
+            show_standards, show_modifiers, hide_modifiers, advanced = \
+                self._get_active_filters()
+            has_filter = bool(show_standards or show_modifiers or hide_modifiers
+                              or advanced)
             if has_filter and not self._matches_filters(self._file_tags[path],
                                                         show_standards, show_modifiers,
-                                                        hide_modifiers):
+                                                        hide_modifiers, advanced):
                 if self.sidebar.currentItem() is item:
                     self.sidebar.clearSelection()
                     self.tab_widget.clear()
@@ -1373,6 +2062,8 @@ class MidiExaminerWindow(QMainWindow):
         current = self.sidebar.currentItem()
         if current and current.data(Qt.ItemDataRole.UserRole) == path:
             self._populate_tabs(path)
+        self._completed_files += 1
+        self._update_progress()
         if self._pending_paths:
             self.statusBar().showMessage(f"Examined: {os.path.basename(path)}")
         else:
@@ -1389,6 +2080,8 @@ class MidiExaminerWindow(QMainWindow):
         current = self.sidebar.currentItem()
         if current and current.data(Qt.ItemDataRole.UserRole) == path:
             self._populate_tabs(path)
+        self._completed_files += 1
+        self._update_progress()
         self.statusBar().showMessage(f"Error: {os.path.basename(path)}")
         self._start_next_worker()
 

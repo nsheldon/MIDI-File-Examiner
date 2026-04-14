@@ -15,7 +15,9 @@ A tool for analyzing MIDI files, available as a macOS GUI app and a command-line
 - Reports tempo and time signature changes with measure/beat positions
 - Lists SysEx, bank select, program change, text, marker, cue point, and lyric events
 - Outputs results as human-readable text or JSON (command-line)
-- **Filtering:** filter results by MIDI standard, karaoke format, assumed-standard status, or warnings — both in the GUI sidebar and on the command line via `--filter` and `--exclude`
+- **Basic filtering:** filter results by MIDI standard, karaoke format, assumed-standard status, or warnings — both in the GUI sidebar and on the command line via `--filter` and `--exclude`
+- **Advanced filtering:** filter on any combination of duration, MIDI format, track count, note range, velocity range, peak polyphony, key signature, timing type, time signature, tempo range, CC usage, aftertouch, text search, SysEx pattern, Roland SC version, and Yamaha XG level — GUI dialog or CLI flags
+- **GUI progress bar:** status bar shows a file count progress bar during multi-file analysis
 
 ## Requirements
 
@@ -65,6 +67,21 @@ The **Filter** panel above the sidebar lets you narrow the file list without rel
 
 - **Standard checkboxes** (GM, GM2, GS, XG, Unknown) — check any combination to show files matching any of those standards (OR logic); leave all unchecked to show every standard.
 - **Modifier checkboxes** ([?], [!], KAR) — tri-state: one click = show only files with that tag; a second click = hide files with that tag (shown as –); a third click = off.
+- **Reset button** — clears all standard checkboxes, modifier checkboxes, and advanced filters in one click.
+- **Advanced… button** — opens the Advanced Filter dialog. The button label shows a dot (●) when advanced filters are active.
+
+#### Advanced Filter dialog
+
+The dialog is organized into four sections:
+
+| Section | Controls |
+|---------|----------|
+| **File Info** | Min/max duration, MIDI format type (Type 0/1/2), min/max track count, Roland SC version requirement (SC-55/SC-88/SC-88Pro/SC-8850), Yamaha XG level (Level 1/2/3) |
+| **Notes & Velocity** | Min/max note range, min/max velocity range, min/max peak polyphony, key signature (multi-select, OR logic) |
+| **Timing & Events** | Timing type (PPQ/SMPTE), time signature, min/max tempo, CC numbers (all must be present), polyphonic aftertouch, channel aftertouch |
+| **Search** | Case-insensitive text substring (searches all text events, track names, instrument names, patch names, metadata), SysEx hex pattern |
+
+Selecting a Roland SC version automatically checks the GS standard checkbox; selecting an XG level automatically checks XG. Unchecking GS or XG clears the corresponding sub-filters. Leave all fields at their default (—) to apply no constraint for that property.
 
 ### Command Line
 
@@ -86,6 +103,36 @@ python midi_examiner.py --json <midi_file> > analysis.json
 | `--paths-only` | Print only matching file paths, one per line — useful for piping to other tools. Cannot be combined with `--json`. |
 | `--version` | Show the version number and exit |
 
+**Advanced filter options:**
+
+| Option | Description |
+|--------|-------------|
+| `--min-duration S` | Show only files at least S seconds long (M:SS and H:MM:SS also accepted) |
+| `--max-duration S` | Show only files at most S seconds long |
+| `--format TYPE` | Show only files of MIDI format type 0, 1, or 2 |
+| `--timing-type TYPE` | Show only files using `PPQ` or `SMPTE` timing |
+| `--time-sig N/D` | Show only files containing this time signature (e.g. `4/4`, `6/8`) |
+| `--key-sig KEY` | Show only files with this key signature (e.g. `C`, `Am`, `F#m`); may be repeated for OR logic |
+| `--min-tracks N` | Show only files with at least N tracks |
+| `--max-tracks N` | Show only files with at most N tracks |
+| `--min-note NOTE` | Show only files whose lowest note >= NOTE (MIDI 0–127 or name, e.g. `C4`) |
+| `--max-note NOTE` | Show only files whose highest note <= NOTE |
+| `--min-velocity N` | Show only files whose minimum note velocity >= N (1–127) |
+| `--max-velocity N` | Show only files whose maximum note velocity <= N |
+| `--min-polyphony N` | Show only files with peak polyphony >= N |
+| `--max-polyphony N` | Show only files with peak polyphony <= N |
+| `--min-tempo BPM` | Show only files whose tempo range reaches at least BPM |
+| `--max-tempo BPM` | Show only files whose tempo range includes at most BPM |
+| `--has-cc CC` | Show only files that use CC number CC (0–127); may be repeated — all listed CCs must be present |
+| `--has-poly-aftertouch` | Show only files that use polyphonic aftertouch |
+| `--no-poly-aftertouch` | Show only files that do NOT use polyphonic aftertouch |
+| `--has-channel-aftertouch` | Show only files that use channel aftertouch |
+| `--no-channel-aftertouch` | Show only files that do NOT use channel aftertouch |
+| `--search TEXT` | Show only files containing TEXT in any text event, track name, instrument name, patch name, or metadata (case-insensitive substring) |
+| `--has-sysex HEX` | Show only files containing a SysEx message that includes these bytes (space-separated hex, e.g. `F0 41 10`) |
+| `--sc-version VERSION` | Show only GS files requiring this minimum SC version; may be repeated for OR logic (choices: `SC-55`, `SC-88`, `SC-88Pro`, `SC-8850`) |
+| `--xg-level LEVEL` | Show only XG files requiring this minimum XG level; may be repeated for OR logic (choices: `1`, `2`, `3`) |
+
 **Filter examples:**
 
 ```bash
@@ -103,6 +150,15 @@ python midi_examiner.py --exclude assumed --exclude warnings /path/to/folder/
 
 # Pipe matching paths to another tool
 python midi_examiner.py --filter GS --paths-only /path/to/folder/ | xargs some_tool
+
+# Show only files longer than 3 minutes in 3/4 time
+python midi_examiner.py --min-duration 3:00 --time-sig 3/4 /path/to/folder/
+
+# Show GS files requiring at least SC-88
+python midi_examiner.py --filter GS --sc-version SC-88 --sc-version SC-88Pro --sc-version SC-8850 /path/to/folder/
+
+# Show files in C major or A minor that use CC 64 (sustain pedal)
+python midi_examiner.py --key-sig C --key-sig Am --has-cc 64 /path/to/folder/
 ```
 
 ## Example Output
