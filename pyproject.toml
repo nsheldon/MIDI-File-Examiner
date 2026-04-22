@@ -1,0 +1,54 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "midi-file-examiner"
+version = "1.3.0"
+description = "Analyze MIDI files from the command line or a PyQt6 macOS GUI."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Nathan Sheldon" },
+]
+dependencies = [
+    "mido>=1.3.0",
+    "PyQt6>=6.0",
+]
+keywords = ["midi", "audio", "cli", "pyqt", "macos"]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: MacOS X",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: MIDI",
+]
+
+[project.urls]
+Homepage = "https://github.com/nsheldon/MIDI-File-Examiner"
+Repository = "https://github.com/nsheldon/MIDI-File-Examiner"
+
+[project.scripts]
+midi-file-examiner = "midi_examiner:main"
+midi-file-examiner-gui = "midi_examiner_gui:main"
+midi-file-examiner-build-app = "create_app:build_app"
+
+[tool.setuptools]
+py-modules = [
+    "create_app",
+    "midi_examiner",
+    "midi_examiner_gui",
+    "midi_patches_db",
+]
+include-package-data = true
+
+[tool.setuptools.data-files]
+"" = ["midi_patches.db"]

@@ -21,7 +21,7 @@ A tool for analyzing MIDI files, available as a macOS GUI app and a command-line
 
 ## Requirements
 
-- Python 3.6+
+- Python 3.8+
 - [mido](https://mido.readthedocs.io/) (`pip install mido`)
 - [PyQt6](https://pypi.org/project/PyQt6/) (`pip install PyQt6`) — GUI only
 
@@ -30,8 +30,10 @@ A tool for analyzing MIDI files, available as a macOS GUI app and a command-line
 ```bash
 git clone https://github.com/nsheldon/MIDI-File-Examiner.git
 cd MIDI-File-Examiner
-pip install -r requirements.txt
+python3 -m pip install -e .
 ```
+
+This project now includes a `pyproject.toml`, so the folder can be installed as a standard Python project in editable mode during development.
 
 ## Usage
 
@@ -41,6 +43,7 @@ For the most convenient experience, build the native macOS app bundle once after
 
 ```bash
 python3 create_app.py
+midi-file-examiner-build-app
 ```
 
 This generates **MIDI File Examiner.app** in the project folder. You can then:
@@ -59,6 +62,7 @@ The app automatically matches the macOS Light or Dark appearance and updates if 
 ```bash
 python3 midi_examiner_gui.py
 python3 midi_examiner_gui.py song.mid   # open a file directly on launch
+midi-file-examiner-gui
 ```
 
 Drag and drop `.mid` or `.midi` files and folders onto the window to analyze them.
@@ -89,6 +93,7 @@ Selecting a Roland SC version automatically checks the GS standard checkbox; sel
 python midi_examiner.py <midi_file>
 python midi_examiner.py --json <midi_file>
 python midi_examiner.py --json <midi_file> > analysis.json
+midi-file-examiner <midi_file>
 ```
 
 ### Command-Line Options
