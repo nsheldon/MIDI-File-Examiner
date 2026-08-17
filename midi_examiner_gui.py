@@ -134,7 +134,8 @@ def _setup_services_menu():
             return
 
         # Only set up once — if a services menu is already set, we're done.
-        if msg0(NSApp, b'servicesMenu'):
+        existing_menu = msg0(NSApp, b'servicesMenu')
+        if existing_menu:
             return
 
         # Create a new NSMenu (retain count = 1, we own it).
@@ -153,8 +154,8 @@ def _setup_services_menu():
         msg0(svc_menu, b'release')
 
         # Register both UTI and legacy pasteboard types so all text services
-        # (including "Look Up in Dictionary" which only accepts NSStringPboardType)
-        # appear in the Services menu.
+        # (including "Look Up in Dictionary" which only accepts the legacy
+        # NSStringPboardType) appear in the Services menu.
         NSMutableArray_cls = lib.objc_getClass(b'NSMutableArray')
         arr = msg0(NSMutableArray_cls, b'array')
         msg1(arr, b'addObject:', nsstr('public.utf8-plain-text'))
@@ -693,8 +694,11 @@ def _is_dark_mode(app):
                 capture_output=True, text=True, timeout=2,
             )
             return result.stdout.strip().lower() == "dark"
-        except Exception:
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
             pass
+        except Exception:
+            import traceback
+            traceback.print_exc()
     # Non-macOS or 'defaults' unavailable: fall back to Qt APIs
     try:
         return app.styleHints().colorScheme() == Qt.ColorScheme.Dark

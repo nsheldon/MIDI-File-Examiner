@@ -18,7 +18,7 @@ except ImportError:
     print("Error: mido library is required. Install it with: pip install mido")
     sys.exit(1)
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 # ── Terminal colour support ───────────────────────────────────────────────────
 
@@ -284,6 +284,8 @@ def ticks_to_measure_beat(absolute_ticks, ppqn, time_signatures):
     Returns:
         Tuple of (measure, beat, subdivision) where measure and beat are 1-indexed
     """
+    if ppqn <= 0:
+        return (1, 1, 0)
     if not time_signatures:
         # Default to 4/4 if no time signature
         time_signatures = [{"abs_time": 0, "numerator": 4, "denominator": 4}]
@@ -1117,7 +1119,10 @@ def analyze_midi_file(filepath):
                     results["timing"]["time_signature"] = []
                 notated_32nd = msg.notated_32nd_notes_per_beat
                 if notated_32nd == 0:
-                    warn = "File contains an invalid notated_32nd_notes_per_beat value of 0 in a time signature event; defaulted to 8."
+                    warn = (
+                        "File contains an invalid notated_32nd_notes_per_beat value "
+                        "of 0 in a time signature event; defaulted to 8."
+                    )
                     if warn not in results["warnings"]:
                         results["warnings"].append(warn)
                     notated_32nd = 8
@@ -1683,7 +1688,8 @@ def analyze_midi_file(filepath):
     # Apply this after standard is finalized and names are re-resolved.
     if detected_standard == "XG":
         for pc in results["program_changes"]:
-            if pc["bank_msb"] in (126, 127) and not pc["is_percussion"]:
+            if pc["bank_msb"] in (126, 127):
+                was_percussion = pc["is_percussion"]
                 pc["is_percussion"] = True
                 name = midi_patches_db.get_percussion_name(
                     pc["bank_msb"], pc["bank_lsb"], pc["program"], detected_standard

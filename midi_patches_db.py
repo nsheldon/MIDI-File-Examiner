@@ -2099,7 +2099,7 @@ def init_database():
 
     conn.commit()
 
-    # Check if data already populated
+    # Populate data only if tables are empty (fresh database).
     cursor.execute("SELECT COUNT(*) FROM patches")
     if cursor.fetchone()[0] == 0:
         _populate_gm_patches(conn)
@@ -2110,12 +2110,27 @@ def init_database():
         _populate_xg_patches(conn)
         _populate_xg_drumkits(conn)
     else:
-        # Check if XG data exists; add it if not (migration for databases
-        # created before XG support was added)
-        cursor.execute("SELECT COUNT(*) FROM patches WHERE standard = 'XG'")
-        if cursor.fetchone()[0] == 0:
-            _populate_xg_patches(conn)
-            _populate_xg_drumkits(conn)
+        # Check each standard individually for migrations.
+        for standard, pop_fn in [
+            ("GM2", _populate_gm2_patches),
+            ("GS", _populate_gs_patches),
+            ("XG", _populate_xg_patches),
+        ]:
+            cursor.execute(f"SELECT COUNT(*) FROM patches WHERE standard = '{standard}'")
+            if cursor.fetchone()[0] == 0:
+                pop_fn(conn)
+        # Check percussion_sets for missing standards.
+        for standard in ("GM2", "GS", "XG"):
+            cursor.execute(
+                f"SELECT COUNT(*) FROM percussion_sets WHERE standard = '{standard}'"
+            )
+            if cursor.fetchone()[0] == 0:
+                if standard == "GM2":
+                    _populate_drum_kits(conn)
+                elif standard == "GS":
+                    _populate_gs_drumkits(conn)
+                else:
+                    _populate_xg_drumkits(conn)
 
     conn.close()
 
@@ -2279,80 +2294,81 @@ def get_patch_name(bank_msb, bank_lsb, program, standard=None):
         Tuple of (name, category) or (None, None) if not found
     """
     conn = get_connection()
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    result = None
+        result = None
 
-    # If standard specified, try exact match first
-    if standard:
-        cursor.execute("""
-            SELECT name, category FROM patches
-            WHERE standard = ? AND bank_msb = ? AND bank_lsb = ? AND program = ?
-        """, (standard, bank_msb, bank_lsb, program))
-        result = cursor.fetchone()
-
-    # GS-specific fallback: try lower bank_lsb values (older SC generations)
-    if not result and standard == "GS":
-        for fallback_lsb in range(bank_lsb - 1, 0, -1):
+        # If standard specified, try exact match first
+        if standard:
             cursor.execute("""
                 SELECT name, category FROM patches
-                WHERE standard = 'GS' AND bank_msb = ? AND bank_lsb = ? AND program = ?
-            """, (bank_msb, fallback_lsb, program))
+                WHERE standard = ? AND bank_msb = ? AND bank_lsb = ? AND program = ?
+            """, (standard, bank_msb, bank_lsb, program))
             result = cursor.fetchone()
-            if result:
-                break
 
-        # When no CC32 was sent (bank_lsb=0), the SC generation is unknown.
-        # Try the stated bank_msb with each SC generation LSB (1–4) so that
-        # variation names (e.g. MSB=8 → "Brass 2") are resolved rather than
-        # always falling back to the MSB=0 base patch.
-        if not result and bank_lsb == 0:
-            for gen_lsb in range(1, 5):
+        # GS-specific fallback: try lower bank_lsb values (older SC generations)
+        if not result and standard == "GS":
+            for fallback_lsb in range(bank_lsb - 1, 0, -1):
                 cursor.execute("""
                     SELECT name, category FROM patches
                     WHERE standard = 'GS' AND bank_msb = ? AND bank_lsb = ? AND program = ?
-                """, (bank_msb, gen_lsb, program))
+                """, (bank_msb, fallback_lsb, program))
                 result = cursor.fetchone()
                 if result:
                     break
 
-        # Fall back to base GS patch (MSB=0, LSB=1)
-        if not result and (bank_msb != 0 or bank_lsb != 1):
+            # When no CC32 was sent (bank_lsb=0), the SC generation is unknown.
+            # Try the stated bank_msb with each SC generation LSB (1–4) so that
+            # variation names (e.g. MSB=8 → "Brass 2") are resolved rather than
+            # always falling back to the MSB=0 base patch.
+            if not result and bank_lsb == 0:
+                for gen_lsb in range(1, 5):
+                    cursor.execute("""
+                        SELECT name, category FROM patches
+                        WHERE standard = 'GS' AND bank_msb = ? AND bank_lsb = ? AND program = ?
+                    """, (bank_msb, gen_lsb, program))
+                    result = cursor.fetchone()
+                    if result:
+                        break
+
+            # Fall back to base GS patch (MSB=0, LSB=1)
+            if not result and (bank_msb != 0 or bank_lsb != 1):
+                cursor.execute("""
+                    SELECT name, category FROM patches
+                    WHERE standard = 'GS' AND bank_msb = 0 AND bank_lsb = 1 AND program = ?
+                """, (program,))
+                result = cursor.fetchone()
+
+        # If no match, try any standard with exact bank/program
+        if not result:
             cursor.execute("""
                 SELECT name, category FROM patches
-                WHERE standard = 'GS' AND bank_msb = 0 AND bank_lsb = 1 AND program = ?
+                WHERE bank_msb = ? AND bank_lsb = ? AND program = ?
+                ORDER BY CASE standard
+                    WHEN 'GM' THEN 1
+                    WHEN 'GM2' THEN 2
+                    WHEN 'GS' THEN 3
+                    WHEN 'XG' THEN 4
+                    ELSE 5
+                END
+                LIMIT 1
+            """, (bank_msb, bank_lsb, program))
+            result = cursor.fetchone()
+
+        # Fall back to GM base patch (Bank 0:0)
+        if not result and (bank_msb != 0 or bank_lsb != 0):
+            cursor.execute("""
+                SELECT name, category FROM patches
+                WHERE standard = 'GM' AND bank_msb = 0 AND bank_lsb = 0 AND program = ?
             """, (program,))
             result = cursor.fetchone()
 
-    # If no match, try any standard with exact bank/program
-    if not result:
-        cursor.execute("""
-            SELECT name, category FROM patches
-            WHERE bank_msb = ? AND bank_lsb = ? AND program = ?
-            ORDER BY CASE standard
-                WHEN 'GM' THEN 1
-                WHEN 'GM2' THEN 2
-                WHEN 'GS' THEN 3
-                WHEN 'XG' THEN 4
-                ELSE 5
-            END
-            LIMIT 1
-        """, (bank_msb, bank_lsb, program))
-        result = cursor.fetchone()
-
-    # Fall back to GM base patch (Bank 0:0)
-    if not result and (bank_msb != 0 or bank_lsb != 0):
-        cursor.execute("""
-            SELECT name, category FROM patches
-            WHERE standard = 'GM' AND bank_msb = 0 AND bank_lsb = 0 AND program = ?
-        """, (program,))
-        result = cursor.fetchone()
-
-    conn.close()
-
-    if result:
-        return result[0], result[1]
-    return None, None
+        if result:
+            return result[0], result[1]
+        return None, None
+    finally:
+        conn.close()
 
 
 def get_percussion_name(bank_msb, bank_lsb, program, standard=None):
@@ -2369,85 +2385,86 @@ def get_percussion_name(bank_msb, bank_lsb, program, standard=None):
         Percussion set name or None if not found
     """
     conn = get_connection()
-    cursor = conn.cursor()
+    try:
+        cursor = conn.cursor()
 
-    result = None
+        result = None
 
-    # If standard specified, try exact match first
-    if standard:
-        cursor.execute("""
-            SELECT name FROM percussion_sets
-            WHERE standard = ? AND bank_msb = ? AND bank_lsb = ? AND program = ?
-        """, (standard, bank_msb, bank_lsb, program))
-        result = cursor.fetchone()
-
-    # GS-specific fallback: try lower bank_lsb values (older SC generations),
-    # then SC-55 base kit (lsb=1) — covers the common case where no CC32 is
-    # sent on the percussion channel (bank_lsb stays at 0).
-    if not result and standard == "GS":
-        for fallback_lsb in range(bank_lsb - 1, 0, -1):
+        # If standard specified, try exact match first
+        if standard:
             cursor.execute("""
                 SELECT name FROM percussion_sets
-                WHERE standard = 'GS' AND bank_msb = ? AND bank_lsb = ? AND program = ?
-            """, (bank_msb, fallback_lsb, program))
+                WHERE standard = ? AND bank_msb = ? AND bank_lsb = ? AND program = ?
+            """, (standard, bank_msb, bank_lsb, program))
             result = cursor.fetchone()
-            if result:
-                break
-        # Final GS fallback: try all SC generations (lsb 1–4) when no CC32 was sent
-        # (bank_lsb=0 means no CC32; kits like "STANDARD 2" only exist at lsb≥2)
-        if not result and bank_lsb == 0:
-            for gen_lsb in range(1, 5):
+
+        # GS-specific fallback: try lower bank_lsb values (older SC generations),
+        # then SC-55 base kit (lsb=1) — covers the common case where no CC32 is
+        # sent on the percussion channel (bank_lsb stays at 0).
+        if not result and standard == "GS":
+            for fallback_lsb in range(bank_lsb - 1, 0, -1):
                 cursor.execute("""
                     SELECT name FROM percussion_sets
                     WHERE standard = 'GS' AND bank_msb = ? AND bank_lsb = ? AND program = ?
-                """, (bank_msb, gen_lsb, program))
+                """, (bank_msb, fallback_lsb, program))
                 result = cursor.fetchone()
                 if result:
                     break
-        elif not result:
+            # Final GS fallback: try all SC generations (lsb 1–4) when no CC32 was sent
+            # (bank_lsb=0 means no CC32; kits like "STANDARD 2" only exist at lsb≥2)
+            if not result and bank_lsb == 0:
+                for gen_lsb in range(1, 5):
+                    cursor.execute("""
+                        SELECT name FROM percussion_sets
+                        WHERE standard = 'GS' AND bank_msb = ? AND bank_lsb = ? AND program = ?
+                    """, (bank_msb, gen_lsb, program))
+                    result = cursor.fetchone()
+                    if result:
+                        break
+            elif not result:
+                cursor.execute("""
+                    SELECT name FROM percussion_sets
+                    WHERE standard = 'GS' AND bank_msb = ? AND bank_lsb = 1 AND program = ?
+                """, (bank_msb, program))
+                result = cursor.fetchone()
+
+        # If no match, try any standard with exact bank/program
+        if not result:
             cursor.execute("""
                 SELECT name FROM percussion_sets
-                WHERE standard = 'GS' AND bank_msb = ? AND bank_lsb = 1 AND program = ?
-            """, (bank_msb, program))
+                WHERE bank_msb = ? AND bank_lsb = ? AND program = ?
+                ORDER BY CASE standard
+                    WHEN 'GM' THEN 1
+                    WHEN 'GM2' THEN 2
+                    WHEN 'GS' THEN 3
+                    WHEN 'XG' THEN 4
+                    ELSE 5
+                END
+                LIMIT 1
+            """, (bank_msb, bank_lsb, program))
             result = cursor.fetchone()
 
-    # If no match, try any standard with exact bank/program
-    if not result:
-        cursor.execute("""
-            SELECT name FROM percussion_sets
-            WHERE bank_msb = ? AND bank_lsb = ? AND program = ?
-            ORDER BY CASE standard
-                WHEN 'GM' THEN 1
-                WHEN 'GM2' THEN 2
-                WHEN 'GS' THEN 3
-                WHEN 'XG' THEN 4
-                ELSE 5
-            END
-            LIMIT 1
-        """, (bank_msb, bank_lsb, program))
-        result = cursor.fetchone()
+        # For GM2, try with Bank MSB=120
+        if not result and standard == "GM2":
+            cursor.execute("""
+                SELECT name FROM percussion_sets
+                WHERE standard = 'GM2' AND bank_msb = 120 AND bank_lsb = 0 AND program = ?
+            """, (program,))
+            result = cursor.fetchone()
 
-    # For GM2, try with Bank MSB=120
-    if not result and standard == "GM2":
-        cursor.execute("""
-            SELECT name FROM percussion_sets
-            WHERE standard = 'GM2' AND bank_msb = 120 AND bank_lsb = 0 AND program = ?
-        """, (program,))
-        result = cursor.fetchone()
+        # Fall back to GM Standard Kit
+        if not result:
+            cursor.execute("""
+                SELECT name FROM percussion_sets
+                WHERE standard = 'GM' AND bank_msb = 0 AND bank_lsb = 0 AND program = 0
+            """)
+            result = cursor.fetchone()
 
-    # Fall back to GM Standard Kit
-    if not result:
-        cursor.execute("""
-            SELECT name FROM percussion_sets
-            WHERE standard = 'GM' AND bank_msb = 0 AND bank_lsb = 0 AND program = 0
-        """)
-        result = cursor.fetchone()
-
-    conn.close()
-
-    if result:
-        return result[0]
-    return None
+        if result:
+            return result[0]
+        return None
+    finally:
+        conn.close()
 
 
 def get_instrument_name(program, channel=None, bank_msb=0, bank_lsb=0, standard=None):
